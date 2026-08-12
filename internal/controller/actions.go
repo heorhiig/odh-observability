@@ -44,6 +44,7 @@ const (
 	TempoStackTemplate                            = "resources/tempo-stack.tmpl.yaml"
 	OpenTelemetryCollectorTemplate                = "resources/opentelemetry-collector.tmpl.yaml"
 	CollectorServiceMonitorsTemplate              = "resources/collector-servicemonitors.tmpl.yaml"
+	CollectorMonitorServiceTemplate                  = "resources/collector-monitor-service.tmpl.yaml"
 	CollectorPrometheusServiceTemplate            = "resources/collector-prometheus-service.tmpl.yaml"
 	CollectorRBACTemplate                         = "resources/collector-rbac.tmpl.yaml"
 	PrometheusRouteTemplate                       = "resources/data-science-prometheus-route.tmpl.yaml"
@@ -235,6 +236,8 @@ func deployOpenTelemetryCollector(
 		src(OpenTelemetryCollectorTemplate),
 		src(CollectorRBACTemplate),
 		src(CollectorServiceMonitorsTemplate),
+		// Service for internal telemetry re-exported on :8890 with TLS (always-on)
+		src(CollectorMonitorServiceTemplate),
 	)
 
 	if monitoring.Spec.Metrics != nil {
