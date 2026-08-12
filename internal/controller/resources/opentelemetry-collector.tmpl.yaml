@@ -243,4 +243,3 @@ spec:
           processors: [memory_limiter, k8sattributes, resourcedetection, batch]
           exporters: [prometheus{{- if .MetricsExporterNames }}{{- range .MetricsExporterNames }}, {{ . }}{{- end }}{{- end }}]
       {{- end }}
-li
