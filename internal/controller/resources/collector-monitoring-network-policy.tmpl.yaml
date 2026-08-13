@@ -22,4 +22,15 @@ spec:
               app.kubernetes.io/instance: data-science-monitoringstack
       ports:
         - protocol: TCP
+          port: 8889
+        - protocol: TCP
           port: 8890
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.Namespace}}
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
