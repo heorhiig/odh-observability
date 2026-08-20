@@ -525,8 +525,8 @@ func TestDeployClusterLogForwarder_CRDPresent(t *testing.T) {
 	readyLoki.SetGroupVersionKind(gvk.LokiStack)
 	readyLoki.SetName("data-science-lokistack")
 	readyLoki.SetNamespace(m.Spec.Namespace)
-	_ = unstructured.SetNestedSlice(readyLoki.Object, []interface{}{
-		map[string]interface{}{
+	_ = unstructured.SetNestedSlice(readyLoki.Object, []any{
+		map[string]any{
 			"type":   "Ready",
 			"status": "True",
 		},

@@ -75,7 +75,7 @@ func discoverInferenceNamespaces(ctx context.Context, c client.Client) ([]string
 
 		if err := c.List(ctx, list); err != nil {
 			if meta.IsNoMatchError(err) || errors.IsNotFound(err) {
-				continue // CRD не встановлений — пропускаємо
+				continue // CRD is not installed — skip.
 			}
 			return nil, fmt.Errorf("listing %s: %w", g.Kind, err)
 		}
@@ -95,8 +95,6 @@ func discoverInferenceNamespaces(ctx context.Context, c client.Client) ([]string
 
 	return namespaces, nil
 }
-
-
 
 // syncPrometheusWebTLSCA copies the service-ca.crt from the prometheus-web-tls-ca ConfigMap
 // into a same-named Secret so MonitoringStack can consume it.

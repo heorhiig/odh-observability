@@ -68,7 +68,7 @@ func TestHasCRD_MultipleCRDsRegistered(t *testing.T) {
 
 // --- discoverInferenceNamespaces ---
 
-// CRDs exist, CRs exist in different namespaces → returns those namespaces
+// CRDs exist, CRs exist in different namespaces → returns those namespaces.
 func TestDiscoverInferenceNamespaces(t *testing.T) {
 	s := newTestScheme(t)
 	registerCRDs(s, gvk.InferenceService, gvk.LLMInferenceService)
@@ -95,7 +95,7 @@ func TestDiscoverInferenceNamespaces(t *testing.T) {
 	}
 }
 
-// CRDs not installed → returns empty, no error
+// CRDs not installed → returns empty, no error.
 func TestDiscoverInferenceNamespaces_NoCRDs(t *testing.T) {
 	s := newTestScheme(t)
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
@@ -109,7 +109,7 @@ func TestDiscoverInferenceNamespaces_NoCRDs(t *testing.T) {
 	}
 }
 
-// CRDs registered but no CRs exist → returns empty
+// CRDs registered but no CRs exist → returns empty.
 func TestDiscoverInferenceNamespaces_NoCRs(t *testing.T) {
 	s := newTestScheme(t)
 	registerCRDs(s, gvk.InferenceService, gvk.LLMInferenceService)
@@ -124,6 +124,7 @@ func TestDiscoverInferenceNamespaces_NoCRs(t *testing.T) {
 		t.Errorf("expected empty namespaces, got %v", namespaces)
 	}
 }
+
 // --- syncPrometheusWebTLSCA ---
 
 func TestSyncPrometheusWebTLSCA_NoMetrics(t *testing.T) {

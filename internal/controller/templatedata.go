@@ -134,7 +134,6 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	lokiStackName := "data-science-lokistack"
 	templateData["LokiStackName"] = lokiStackName
 
-
 	templateData["UsageLogsCollectorName"] = "usage-logs"
 	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
 		templateData["LokiStorageCredentialMode"] = usageLogs.Storage.CredentialMode
