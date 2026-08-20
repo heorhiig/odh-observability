@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"sort"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -31,6 +32,7 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
 const fieldManager = "odh-observability-controller"
@@ -54,6 +56,47 @@ func hasCRD(ctx context.Context, c client.Client, g schema.GroupVersionKind) (bo
 
 	return true, nil
 }
+
+// discoverInferenceNamespaces lists all InferenceService and LLMInferenceService
+// CRs cluster-wide and returns the unique set of namespaces they live in.
+func discoverInferenceNamespaces(ctx context.Context, c client.Client) ([]string, error) {
+	seen := map[string]struct{}{}
+
+	for _, g := range []schema.GroupVersionKind{
+		gvk.InferenceService,
+		gvk.LLMInferenceService,
+	} {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   g.Group,
+			Version: g.Version,
+			Kind:    g.Kind + "List",
+		})
+
+		if err := c.List(ctx, list); err != nil {
+			if meta.IsNoMatchError(err) || errors.IsNotFound(err) {
+				continue // CRD не встановлений — пропускаємо
+			}
+			return nil, fmt.Errorf("listing %s: %w", g.Kind, err)
+		}
+
+		for _, item := range list.Items {
+			if ns := item.GetNamespace(); ns != "" {
+				seen[ns] = struct{}{}
+			}
+		}
+	}
+
+	namespaces := make([]string, 0, len(seen))
+	for ns := range seen {
+		namespaces = append(namespaces, ns)
+	}
+	sort.Strings(namespaces)
+
+	return namespaces, nil
+}
+
+
 
 // syncPrometheusWebTLSCA copies the service-ca.crt from the prometheus-web-tls-ca ConfigMap
 // into a same-named Secret so MonitoringStack can consume it.
