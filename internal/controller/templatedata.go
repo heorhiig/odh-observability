@@ -170,13 +170,18 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	templateData["ClusterLogForwarderServiceAccount"] = clusterLogForwarderName + "-collector"
 
 	if logs := monitoring.Spec.Logs; logs != nil {
-		namespaces, err := discoverInferenceNamespaces(ctx, c)
-		if err != nil {
-			return nil, fmt.Errorf("discovering inference namespaces: %w", err)
+		var namespaces []string
+		if len(logs.InferenceNamespaces) > 0 {
+			namespaces = logs.InferenceNamespaces
+		} else {
+			var err error
+			namespaces, err = discoverInferenceNamespaces(ctx, c)
+			if err != nil {
+				log.Error(err, "Failed to discover inference namespaces, using fallback")
+				namespaces = nil
+			}
 		}
 		templateData["InferenceNamespaces"] = namespaces
-	} else {
-		templateData["InferenceNamespaces"] = []string{}
 	}
 
 	// Apply SNO-aware defaulting when CollectorReplicas is unset.

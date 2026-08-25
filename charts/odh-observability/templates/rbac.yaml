@@ -43,6 +43,19 @@ rules:
   - apiGroups: ["loki.grafana.com"]
     resources: ["application"]
     verbs: ["create"]
+  # Log-collection
+  - apiGroups: ["logging.openshift.io", "observability.openshift.io"]
+    resources: ["logs"]
+    resourceNames: ["application"]
+    verbs: ["collect"]
+  # ClusterLogForwarder (CLO v6)
+  - apiGroups: ["observability.openshift.io"]
+    resources: ["clusterlogforwarders"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Inference namespace discovery
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferenceservices", "llminferenceservices"]
+    verbs: ["get", "list", "watch"]
   # Perses
   - apiGroups: ["perses.dev"]
     resources: ["perses", "persesdatasources", "persesdashboards"]

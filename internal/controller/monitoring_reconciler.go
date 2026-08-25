@@ -82,6 +82,7 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=loki.grafana.com,resources=lokistacks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=observability.openshift.io,resources=clusterlogforwarders,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=logging.openshift.io;observability.openshift.io,resources=logs,resourceNames=application,verbs=collect
+// +kubebuilder:rbac:groups=serving.kserve.io,resources=inferenceservices;llminferenceservices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors;instrumentations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=perses.dev,resources=perses;persesdatasources;persesdashboards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings;mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
@@ -294,6 +295,15 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	if requeueNeeded {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+
+	// Periodic requeue when logs are enabled so that namespace discovery
+	// picks up new InferenceService/LLMInferenceService deployments without
+	// a dedicated watch (the CRDs are optional and a static watch would
+	// crash the controller if KServe is not installed).
+	if monitoring.Spec.Logs != nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
 

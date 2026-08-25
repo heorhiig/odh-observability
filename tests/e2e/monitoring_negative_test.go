@@ -170,7 +170,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringUsageLogsNegativeConditions(t *te
 		WithCondition(And(
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="UsageLogsNotConfigured")] | length==1`,
 				conditions.ConditionUsageLogsCollectorAvailable),
-			jq.Match(`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="UsageLogsStorageNotConfigured")] | length==1`,
+			jq.Match(`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="LokiNotRequired")] | length==1`,
 				conditions.ConditionLokiStackAvailable),
 		)),
 		WithCustomErrorMsg("UsageLogsCollectorAvailable and LokiStackAvailable should report not configured when usage logs are disabled"),

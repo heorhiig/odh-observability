@@ -504,7 +504,7 @@ func deployUsageLogsCollector(
 	return nil
 }
 
-// deployLokiStack deploys LokiStack when usage logs storage is configured.
+// deployLokiStack deploys LokiStack when usage logs storage or log forwarding is configured.
 func deployLokiStack(
 	ctx context.Context,
 	c client.Client,
@@ -512,9 +512,11 @@ func deployLokiStack(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	if monitoring.Spec.UsageLogs == nil || monitoring.Spec.UsageLogs.Storage == nil {
+	needsLoki := monitoring.Spec.Logs != nil ||
+		(monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil)
+	if !needsLoki {
 		cm.MarkNotConfigured(conditions.ConditionLokiStackAvailable,
-			"UsageLogsStorageNotConfigured", "Usage logs storage not configured in Monitoring CR")
+			"LokiNotRequired", "Neither usage logs storage nor log forwarding configured")
 		return nil
 	}
 

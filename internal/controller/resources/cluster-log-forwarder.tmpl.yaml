@@ -10,13 +10,13 @@ spec:
   - name: inference-app-logs
     type: application
     application:
-{{- if .InferenceNamespaces}}
       includes:
+{{- if .InferenceNamespaces}}
 {{- range .InferenceNamespaces}}
       - namespace: {{.}}
 {{- end}}
 {{- else}}
-      {}
+      - namespace: {{.Namespace}}
 {{- end}}
   outputs:
   - name: data-science-lokistack
