@@ -82,6 +82,9 @@ const (
 	maxTotalExporterSize = 51200 // Maximum total size for all exporters combined (50KB).
 )
 
+// dns1123LabelRe matches valid DNS-1123 labels (Kubernetes namespace names).
+var dns1123LabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$`)
+
 var componentIDRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)?$`)
 
 // buildTemplateData constructs the data map passed to all YAML templates.
@@ -172,7 +175,13 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	if logs := monitoring.Spec.Logs; logs != nil {
 		var namespaces []string
 		if len(logs.InferenceNamespaces) > 0 {
-			namespaces = logs.InferenceNamespaces
+			for _, ns := range logs.InferenceNamespaces {
+				if dns1123LabelRe.MatchString(ns) {
+					namespaces = append(namespaces, ns)
+				} else {
+					log.Info("Skipping invalid namespace in spec.logs.inferenceNamespaces", "namespace", ns)
+				}
+			}
 		} else {
 			var err error
 			namespaces, err = discoverInferenceNamespaces(ctx, c)
