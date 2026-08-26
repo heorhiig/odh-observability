@@ -263,6 +263,10 @@ spec:
               rule: '!has(self.collectorReplicas) || (self.collectorReplicas > 0 &&
                 ((has(self.metrics) && self.metrics.storage != null) || self.traces
                 != null))'
+            - message: Log forwarding requires usageLogs.storage to be configured
+                (both features share the LokiStack instance)
+              rule: 'has(self.logs) ? (has(self.usageLogs) && has(self.usageLogs.storage))
+                : true'
           status:
             description: MonitoringStatus defines the observed state of Monitoring.
             properties:

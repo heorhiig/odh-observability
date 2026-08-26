@@ -574,6 +574,17 @@ func deployClusterLogForwarder(
 		return nil
 	}
 
+	lokiExists, err := hasCRD(ctx, c, gvk.LokiStack)
+	if err != nil {
+		return fmt.Errorf("checking LokiStack CRD: %w", err)
+	}
+	if !lokiExists {
+		cm.MarkFalse(conditions.ConditionClusterLogForwarderAvailable,
+			"LokiStackCRDNotFound",
+			"LokiStack CRD not found")
+		return nil
+	}
+
 	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
