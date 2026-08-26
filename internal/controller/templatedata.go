@@ -182,6 +182,9 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 					log.Info("Skipping invalid namespace in spec.logs.inferenceNamespaces", "namespace", ns)
 				}
 			}
+			if len(namespaces) == 0 {
+				log.Error(nil, "All configured inferenceNamespaces are invalid, CLF will use operator namespace only")
+			}
 		} else {
 			var err error
 			namespaces, err = discoverInferenceNamespaces(ctx, c)

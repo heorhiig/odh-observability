@@ -792,3 +792,42 @@ func TestDeployClusterLogForwarder_MaliciousNamespacesFiltered(t *testing.T) {
 		}
 	}
 }
+
+func TestDeployClusterLogForwarder_AllNamespacesInvalid(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.ClusterLogForwarder, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = &v1alpha1.Logs{
+		InferenceNamespaces: []string{
+			"UPPERCASE",
+			"-starts-bad",
+			"has\nnewline",
+		},
+	}
+
+	readyLoki := &unstructured.Unstructured{}
+	readyLoki.SetGroupVersionKind(gvk.LokiStack)
+	readyLoki.SetName("data-science-lokistack")
+	readyLoki.SetNamespace(m.Spec.Namespace)
+	_ = unstructured.SetNestedSlice(readyLoki.Object, []any{
+		map[string]any{
+			"type":   "Ready",
+			"status": "True",
+		},
+	}, "status", "conditions")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki).WithStatusSubresource(readyLoki).Build()
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+
+	ns, ok := data["InferenceNamespaces"].([]string)
+	if !ok {
+		t.Fatal("InferenceNamespaces should be a []string (possibly nil)")
+	}
+	if len(ns) != 0 {
+		t.Errorf("expected 0 valid namespaces when all are invalid, got %d: %v", len(ns), ns)
+	}
+}

@@ -122,6 +122,8 @@ type TracesTLS struct {
 // Logs defines the configuration for cluster log forwarding via the ClusterLogForwarder operator.
 type Logs struct {
 	// InferenceNamespaces lists the namespaces whose application logs should be forwarded to Loki.
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$`
+	// +kubebuilder:validation:items:MaxLength=63
 	InferenceNamespaces []string `json:"inferenceNamespaces,omitempty"`
 }
 
