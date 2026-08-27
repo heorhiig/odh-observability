@@ -1,3 +1,8 @@
+# This is the only NetworkPolicy that selects the collector pods, so it acts as
+# the collector's sole ingress gate: on clusters with NetworkPolicy enforcement,
+# any ingress not listed below is denied. It intentionally covers both the
+# monitoring scrape ports (8889/8890) and the OTLP receiver ports (4317/4318).
+# OTLP ingress is deliberately restricted to the monitoring namespace.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -25,6 +30,7 @@ spec:
           port: 8889
         - protocol: TCP
           port: 8890
+    # OTLP receivers: only workloads in the monitoring namespace may push telemetry.
     - from:
         - namespaceSelector:
             matchLabels:

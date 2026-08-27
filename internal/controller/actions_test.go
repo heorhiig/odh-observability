@@ -231,7 +231,7 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 5 base sources + 1 prometheus service (since metrics is configured)
+	// 6 sources with the always-on OTel templates included in the metrics path
 	if len(sources) != 6 {
 		t.Errorf("expected 6 sources for metrics+OTel, got %d", len(sources))
 	}
@@ -260,7 +260,7 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 5 base sources only (no prometheus service since metrics nil)
+	// 5 sources with the always-on OTel templates included in the traces path
 	if len(sources) != 5 {
 		t.Errorf("expected 5 sources for traces-only+OTel, got %d", len(sources))
 	}
