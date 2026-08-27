@@ -589,7 +589,7 @@ func (tc *MonitoringTestCtx) ValidateMetricsTLSAlwaysEnabled(t *testing.T) {
 }
 
 // ValidateMonitoringTLSAlwaysEnabled validates that TLS is always enabled for the
-// collector's internal telemetry (:8890)
+// collector's internal telemetry (:8890) monitoring path.
 func (tc *MonitoringTestCtx) ValidateMonitoringTLSAlwaysEnabled(t *testing.T) {
 	t.Helper()
 
