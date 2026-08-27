@@ -203,6 +203,8 @@ func (cm *ConditionsManager) AggregateReady() {
 			continue
 		}
 		switch c.Status {
+		case metav1.ConditionTrue:
+			// Feature is healthy — nothing to do.
 		case metav1.ConditionFalse:
 			if c.Severity != platformcommon.ConditionSeverityInfo {
 				anyFailing = true
