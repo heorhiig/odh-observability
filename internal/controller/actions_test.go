@@ -731,6 +731,7 @@ func TestDeployClusterLogForwarder_ExplicitInferenceNamespaces(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Logs = &v1alpha1.Logs{
+		Storage:             &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "loki-s3", CredentialMode: "static"},
 		InferenceNamespaces: []string{"ns-a", "ns-b"},
 	}
 
@@ -778,6 +779,7 @@ func TestDeployClusterLogForwarder_MaliciousNamespacesFiltered(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "loki-s3", CredentialMode: "static"},
 		InferenceNamespaces: []string{
 			"valid-ns",
 			"injection\n---\napiVersion: v1",
@@ -824,6 +826,7 @@ func TestDeployClusterLogForwarder_AllNamespacesInvalid(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "loki-s3", CredentialMode: "static"},
 		InferenceNamespaces: []string{
 			"UPPERCASE",
 			"-starts-bad",
@@ -854,5 +857,56 @@ func TestDeployClusterLogForwarder_AllNamespacesInvalid(t *testing.T) {
 	}
 	if len(ns) != 0 {
 		t.Errorf("expected 0 valid namespaces when all are invalid, got %d: %v", len(ns), ns)
+	}
+}
+
+func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = nil
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:             "s3",
+			SecretName:       "logs-only-secret",
+			CredentialMode:   "static",
+			StorageClassName: "gp3-csi",
+		},
+		InferenceNamespaces: []string{"inference-ns"},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source (LokiStackTemplate), got %d", len(sources))
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+
+	if data["LokiStorageSecretName"] != "logs-only-secret" {
+		t.Errorf("expected LokiStorageSecretName=logs-only-secret, got %v", data["LokiStorageSecretName"])
+	}
+	if data["LokiStorageType"] != "s3" {
+		t.Errorf("expected LokiStorageType=s3, got %v", data["LokiStorageType"])
+	}
+	if data["LokiStorageCredentialMode"] != "static" {
+		t.Errorf("expected LokiStorageCredentialMode=static, got %v", data["LokiStorageCredentialMode"])
+	}
+	if data["LokiStorageClassName"] != "gp3-csi" {
+		t.Errorf("expected LokiStorageClassName=gp3-csi, got %v", data["LokiStorageClassName"])
+	}
+	if data["UsageLogs"] != false {
+		t.Errorf("expected UsageLogs=false when usageLogs is nil, got %v", data["UsageLogs"])
 	}
 }
