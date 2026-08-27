@@ -20,6 +20,10 @@ import (
 	"context"
 	"testing"
 
+	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	configv1 "github.com/openshift/api/config/v1"
+	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -36,10 +40,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
-	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
-	routev1 "github.com/openshift/api/route/v1"
-
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 )
 
@@ -48,6 +48,7 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(s))
 	utilruntime.Must(v1alpha1.AddToScheme(s))
+	utilruntime.Must(configv1.Install(s))
 	utilruntime.Must(routev1.Install(s))
 	utilruntime.Must(extv1.AddToScheme(s))
 	utilruntime.Must(appsv1.AddToScheme(s))
@@ -59,7 +60,7 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 
 func newTestReconciler(t *testing.T, s *runtime.Scheme, c client.Client) *MonitoringReconciler {
 	t.Helper()
-	cs := fakeclientset.NewSimpleClientset()
+	cs := fakeclientset.NewSimpleClientset() //nolint:staticcheck // NewClientset requires generated apply configs not available in this project
 	return &MonitoringReconciler{
 		Client:          c,
 		Scheme:          s,
@@ -99,7 +100,7 @@ func TestReconcile_Removed(t *testing.T) {
 	}
 
 	var ready, provisioning string
-	for _, c := range m.Status.Status.Conditions {
+	for _, c := range m.Status.Conditions {
 		switch c.Type {
 		case string(platformcommon.ConditionTypeReady):
 			ready = string(c.Status)
@@ -140,7 +141,7 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 	}
 
 	var ready, monAvail string
-	for _, c := range m.Status.Status.Conditions {
+	for _, c := range m.Status.Conditions {
 		switch c.Type {
 		case string(platformcommon.ConditionTypeReady):
 			ready = string(c.Status)
@@ -179,7 +180,7 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	}
 
 	var ready, degraded string
-	for _, c := range m.Status.Status.Conditions {
+	for _, c := range m.Status.Conditions {
 		switch c.Type {
 		case string(platformcommon.ConditionTypeReady):
 			ready = string(c.Status)
@@ -215,7 +216,9 @@ func TestSyncStatusURL_RoutePresent(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), c, m)
+	if err := syncStatusURL(context.Background(), c, m); err != nil {
+		t.Fatalf("syncStatusURL returned error: %v", err)
+	}
 
 	want := "https://thanos.example.com"
 	if m.Status.URL != want {
@@ -231,7 +234,9 @@ func TestSyncStatusURL_RouteMissing(t *testing.T) {
 	m.Status.URL = "https://stale.example.com"
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(m).Build()
-	syncStatusURL(context.Background(), c, m)
+	if err := syncStatusURL(context.Background(), c, m); err != nil {
+		t.Fatalf("syncStatusURL returned error: %v", err)
+	}
 
 	if m.Status.URL != "" {
 		t.Errorf("Status.URL: want empty, got %q", m.Status.URL)
@@ -245,7 +250,9 @@ func TestSyncStatusURL_NoMetrics(t *testing.T) {
 	m.Status.URL = "https://stale.example.com"
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(m).Build()
-	syncStatusURL(context.Background(), c, m)
+	if err := syncStatusURL(context.Background(), c, m); err != nil {
+		t.Fatalf("syncStatusURL: %v", err)
+	}
 
 	if m.Status.URL != "" {
 		t.Errorf("Status.URL: want empty, got %q", m.Status.URL)
@@ -305,7 +312,7 @@ func TestReconcile_ObservedGenerationSet(t *testing.T) {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
 
-	if got := m.Status.Status.ObservedGeneration; got != 7 {
+	if got := m.Status.ObservedGeneration; got != 7 {
 		t.Errorf("ObservedGeneration: want 7, got %d", got)
 	}
 }
