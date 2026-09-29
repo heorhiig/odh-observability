@@ -56,7 +56,7 @@ Action functions run sequentially in a fixed order. Each function checks whether
 
 | Order | Function | Spec Trigger | CRDs Checked | Condition | Templates |
 |-------|----------|-------------|--------------|-----------|-----------|
-| 1 | `deployWebhookInfrastructure` | Always | `Issuer` (cert-manager) | `WebhookAvailable` | webhook-service, webhook-cert-manager, webhook-configuration |
+| 1 | `deployWebhookInfrastructure` | Always | None | `WebhookAvailable` | None -- verifies the cert-manager TLS secret exists; webhook resources are deployed by the Helm chart |
 | 2 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
 | 3 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 11 templates (see inventory) |
 | 4 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
@@ -143,11 +143,13 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 
 ### Webhook Infrastructure
 
-| Template | Resources Created |
-|----------|-------------------|
-| `webhook-service.tmpl.yaml` | Service for webhook endpoint |
-| `webhook-cert-manager.tmpl.yaml` | cert-manager Certificate + Issuer |
-| `webhook-configuration.tmpl.yaml` | MutatingWebhookConfiguration |
+The webhook resources are **not** rendered by the operator. They are deployed by the Helm chart at install time in [`charts/odh-observability/templates/webhook.yaml`](../charts/odh-observability/templates/webhook.yaml).
+
+| Resource | Deployed By |
+|----------|-------------|
+| Service for webhook endpoint | Helm chart |
+| cert-manager Certificate + Issuer | Helm chart |
+| MutatingWebhookConfiguration | Helm chart |
 
 ### Admission Policies
 
@@ -243,14 +245,14 @@ Custom OTel exporters (`spec.metrics.exporters`, `spec.traces.exporters`) go thr
 
 ## Mutating Admission Webhook
 
-The operator includes a mutating admission webhook that injects the `opendatahub.io/monitoring=true` label onto `ServiceMonitor` and `PodMonitor` resources (both `monitoring.coreos.com/v1`).
+The operator includes a mutating admission webhook that injects the `monitoring.opendatahub.io/scrape=true` label onto `ServiceMonitor` and `PodMonitor` resources (both `monitoring.coreos.com/v1`).
 
 ### How It Works
 
-1. A namespace opts in by having the label `opendatahub.io/monitoring=true`.
+1. A namespace opts in by having the label `monitoring.opendatahub.io/scrape=true`.
 2. When a ServiceMonitor or PodMonitor is created/updated in an opted-in namespace, the webhook intercepts the request.
 3. The webhook verifies the `default-monitoring` CR exists (monitoring is active).
-4. If the object does not already have the label, the webhook injects `opendatahub.io/monitoring: "true"` via JSON patch.
+4. If the object does not already have the label, the webhook injects `monitoring.opendatahub.io/scrape: "true"` via JSON patch.
 
 This label is what makes the MonitoringStack's Prometheus instance discover and scrape the monitor.
 

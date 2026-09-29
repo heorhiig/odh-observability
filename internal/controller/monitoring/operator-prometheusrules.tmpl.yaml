@@ -70,3 +70,24 @@ spec:
             summary: "Data Science Alertmanager self-monitoring scrape target is down"
             description: "The alertmanager-self target has been down for more than 10 minutes. Alertmanager health cannot be verified, which may mask alert delivery failures."
             triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#alertmanager-self-scrape-target-down"
+      
+      - name: Webhook Health
+        interval: 1m
+        rules:
+        - alert: MonitoringWebhookUnavailable
+          expr: |
+            absent(kube_pod_status_ready{
+              namespace="{{ .OperatorNamespace }}",
+              pod=~"{{ .OperatorPodPrefix }}.*",
+              condition="true"
+            } == 1)
+          for: 5m
+          labels:
+            severity: critical
+            namespace: "{{ .OperatorNamespace }}"
+          annotations:
+            summary: "Monitoring label-injection webhook is unavailable"
+            description: "No ready operator pod hosting the label-injection webhook for 5 minutes in {{ .OperatorNamespace }}. With failurePolicy: Ignore, new ServiceMonitors/PodMonitors are admitted without the monitoring.opendatahub.io/scrape label and will not be scraped."
+            triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#monitoring-webhook-unavailable"
+
+
