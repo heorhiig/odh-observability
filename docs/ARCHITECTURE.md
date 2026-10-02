@@ -301,7 +301,7 @@ Prometheus (port 9090)
 
 **Authentication**: kube-rbac-proxy validates bearer tokens via Kubernetes TokenReview API.
 
-**Authorization**: SubjectAccessReview checks that the user has permissions for `metrics.k8s.io/pods` in the requested namespace. The verb is derived from the HTTP method (GET -> `get`, POST -> `create`).
+**Authorization**: SubjectAccessReview checks that the user has `get` on `metrics.k8s.io/pods` in the requested (URL-query) namespace. The verb is derived from the HTTP method, and only `GET` (verb `get`) is authorized. `POST` maps to the `create` verb, which no role grants on `metrics.k8s.io/pods`, so POST requests are rejected with 403 at this layer. This is deliberate: prom-label-proxy's `--query-param` extraction merges the URL query and the POST body (via `ParseForm`), so a POST-body `namespace` value could otherwise be OR'd into the enforced label matcher even though kube-rbac-proxy only authorized the URL-query namespace. Rejecting POST removes that bypass. Clients must send `GET /api/v1/query?query=<promql>&namespace=<namespace-name>`.
 
 **Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries.
 
