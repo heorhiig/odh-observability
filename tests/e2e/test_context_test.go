@@ -2,14 +2,19 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,6 +37,7 @@ type TestContext struct {
 	MonitoringCRName    string
 	ApiMode             string
 	DSCICRName          string
+	DefaultStorageClass string
 
 	DefaultResourceOpts []ResourceOpts
 }
@@ -576,6 +582,7 @@ func (tc *TestContext) WithT(t *testing.T) *TestContext {
 		MonitoringCRName:    tc.MonitoringCRName,
 		ApiMode:             tc.ApiMode,
 		DSCICRName:          tc.DSCICRName,
+		DefaultStorageClass: tc.DefaultStorageClass,
 		DefaultResourceOpts: tc.DefaultResourceOpts,
 	}
 }
@@ -621,29 +628,50 @@ func (tc *TestContext) detectMonitoringNamespace(t *testing.T) string {
 	return ns
 }
 
-// ensureOperatorPodRunning verifies that at least one odh-observability
-// operator pod is Running on the cluster. Fails immediately if not found.
-func (tc *TestContext) ensureOperatorPodRunning(t *testing.T) {
+// ensureOperatorDeploymentReady waits for the unique odh-observability
+// Deployment and returns the operand namespace from its manager container.
+func (tc *TestContext) ensureOperatorDeploymentReady(t *testing.T) string {
 	t.Helper()
 
-	pods := &unstructured.UnstructuredList{}
-	pods.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("PodList"))
-
-	err := tc.client.List(tc.ctx, pods,
-		client.MatchingLabels{"app.kubernetes.io/name": "odh-observability"},
-	)
-	if err != nil {
-		t.Fatalf("failed to list operator pods: %v", err)
-	}
-
-	for i := range pods.Items {
-		phase, _, _ := unstructured.NestedString(pods.Items[i].Object, "status", "phase")
-		if phase == "Running" {
-			return
+	var monitoringNamespace string
+	tc.g.Eventually(func() error {
+		deployments := &appsv1.DeploymentList{}
+		if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+			return fmt.Errorf("listing odh-observability Deployments: %w", err)
 		}
-	}
+		if len(deployments.Items) == 0 {
+			return errors.New("odh-observability Deployment not found")
+		}
+		if len(deployments.Items) != 1 {
+			return StopErr(fmt.Errorf("found %d odh-observability Deployments", len(deployments.Items)), "operator Deployment is ambiguous")
+		}
 
-	t.Fatalf("no running odh-observability operator pod found on cluster — run 'make deploy' first")
+		deployment := &deployments.Items[0]
+		replicas := int32(1)
+		if deployment.Spec.Replicas != nil {
+			replicas = *deployment.Spec.Replicas
+		}
+		if replicas == 0 || deployment.Status.ObservedGeneration < deployment.Generation ||
+			deployment.Status.Replicas != replicas || deployment.Status.UpdatedReplicas != replicas ||
+			deployment.Status.AvailableReplicas < replicas {
+			return fmt.Errorf("operator Deployment %s/%s is not fully available", deployment.Namespace, deployment.Name)
+		}
+
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			if container.Name != "manager" {
+				continue
+			}
+			for _, env := range container.Env {
+				if env.Name == "MONITORING_NAMESPACE" && env.Value != "" {
+					monitoringNamespace = env.Value
+					return nil
+				}
+			}
+		}
+		return StopErr(errors.New("MONITORING_NAMESPACE is missing from the manager container"), "operator Deployment is missing its monitoring namespace")
+	}).WithTimeout(5*time.Minute).Should(Succeed(),
+		"odh-observability operator must be deployed before monitoring e2e tests")
+	return monitoringNamespace
 }
 
 // ensureCRDExists verifies that a CRD is registered on the cluster and fails
@@ -660,6 +688,27 @@ func (tc *TestContext) ensureCRDExists(t *testing.T, g schema.GroupVersionKind) 
 	}
 }
 
+func (tc *TestContext) ensureDefaultStorageClass(t *testing.T) string {
+	t.Helper()
+
+	storageClasses := &unstructured.UnstructuredList{}
+	storageClasses.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "storage.k8s.io", Version: "v1", Kind: "StorageClassList",
+	})
+	if err := tc.client.List(tc.ctx, storageClasses); err != nil {
+		t.Fatalf("failed to list StorageClasses: %v", err)
+	}
+	for _, storageClass := range storageClasses.Items {
+		annotations := storageClass.GetAnnotations()
+		if annotations["storageclass.kubernetes.io/is-default-class"] == "true" ||
+			annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
+			return storageClass.GetName()
+		}
+	}
+	t.Fatal("monitoring e2e tests require a default StorageClass for operand PVCs")
+	return ""
+}
+
 // OLM operator installation helpers.
 
 func (tc *TestContext) ensureNamespaceExists(name string) {
@@ -670,12 +719,38 @@ func (tc *TestContext) ensureNamespaceExists(name string) {
 }
 
 func (tc *TestContext) ensureOperatorGroupExists(namespace, name string) {
-	items := &unstructured.UnstructuredList{}
-	items.SetGroupVersionKind(gvk.OperatorGroup)
+	var (
+		items           *unstructured.UnstructuredList
+		namespaceLabels map[string]string
+	)
+	tc.g.Eventually(func() error {
+		ns := &corev1.Namespace{}
+		if err := tc.client.Get(tc.ctx, types.NamespacedName{Name: namespace}, ns); err != nil {
+			return err
+		}
 
-	err := tc.client.List(tc.ctx, items, client.InNamespace(namespace))
-	if err == nil && len(items.Items) > 0 {
+		listed := &unstructured.UnstructuredList{}
+		listed.SetGroupVersionKind(gvk.OperatorGroup)
+		if err := tc.client.List(tc.ctx, listed, client.InNamespace(namespace)); err != nil {
+			return err
+		}
+
+		namespaceLabels = ns.Labels
+		items = listed
+		return nil
+	}).WithTimeout(tc.Timeouts.olmOperationTimeout).WithPolling(2 * time.Second).Should(Succeed())
+	if items == nil {
+		tc.t.Fatalf("failed to list OperatorGroups in namespace %s", namespace)
 		return
+	}
+
+	for i := range items.Items {
+		if operatorGroupTargetsNamespace(&items.Items[i], namespace, namespaceLabels) {
+			return
+		}
+	}
+	if len(items.Items) > 0 {
+		tc.t.Fatalf("existing OperatorGroup in namespace %s does not target namespace %s", namespace, namespace)
 	}
 
 	tc.EventuallyResourceCreatedOrPatched(
@@ -684,7 +759,48 @@ func (tc *TestContext) ensureOperatorGroupExists(namespace, name string) {
 	)
 }
 
+func operatorGroupTargetsNamespace(group *unstructured.Unstructured, namespace string, namespaceLabels map[string]string) bool {
+	targetNamespaces, found, err := unstructured.NestedStringSlice(group.Object, "spec", "targetNamespaces")
+	if err != nil {
+		return false
+	}
+	if found && len(targetNamespaces) > 0 {
+		return slices.Contains(targetNamespaces, namespace)
+	}
+
+	rawSelector, found, err := unstructured.NestedMap(group.Object, "spec", "selector")
+	if err != nil || !found || len(rawSelector) == 0 {
+		return err == nil
+	}
+
+	selector := &metav1.LabelSelector{}
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(rawSelector, selector); err != nil {
+		return false
+	}
+	parsedSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return false
+	}
+	return parsedSelector.Matches(labels.Set(namespaceLabels))
+}
+
+func (tc *TestContext) ensureOwnNamespaceOperatorGroup(namespace, name string) {
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.OperatorGroup, types.NamespacedName{Name: name, Namespace: namespace}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			return unstructured.SetNestedSlice(u.Object, []any{namespace}, "spec", "targetNamespaces")
+		}),
+		WithCondition(jq.Match(`.spec.targetNamespaces | contains([%q])`, namespace)),
+		WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
+		WithCustomErrorMsg("OperatorGroup %s/%s should target its own namespace", namespace, name),
+	)
+}
+
 func (tc *TestContext) ensureSubscriptionExists(namespace, name, channel string) {
+	tc.ensureSubscriptionExistsFromCatalog(namespace, name, channel, "redhat-operators")
+}
+
+func (tc *TestContext) ensureSubscriptionExistsFromCatalog(namespace, name, channel, source string) {
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.Subscription, types.NamespacedName{Name: name, Namespace: namespace}),
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
@@ -694,10 +810,7 @@ func (tc *TestContext) ensureSubscriptionExists(namespace, name, channel string)
 			if err := unstructured.SetNestedField(u.Object, channel, "spec", "channel"); err != nil {
 				return err
 			}
-			if err := unstructured.SetNestedField(u.Object, name, "spec", "package"); err != nil {
-				return err
-			}
-			if err := unstructured.SetNestedField(u.Object, "redhat-operators", "spec", "source"); err != nil {
+			if err := unstructured.SetNestedField(u.Object, source, "spec", "source"); err != nil {
 				return err
 			}
 			if err := unstructured.SetNestedField(u.Object, "openshift-marketplace", "spec", "sourceNamespace"); err != nil {
@@ -705,22 +818,47 @@ func (tc *TestContext) ensureSubscriptionExists(namespace, name, channel string)
 			}
 			return unstructured.SetNestedField(u.Object, "Automatic", "spec", "installPlanApproval")
 		}),
-		WithCondition(jq.Match(`.status | has("installPlanRef")`)),
+		WithCondition(jq.Match(`(.spec.source == %q) and (.status | has("installPlanRef"))`, source)),
 		WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
-		WithCustomErrorMsg("Subscription %s/%s should have an installPlanRef", namespace, name),
+		WithCustomErrorMsg("Subscription %s/%s should use catalog %s and have an installPlanRef", namespace, name, source),
 	)
 }
 
-func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types.NamespacedName) {
+func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types.NamespacedName, source string) {
 	tc.g.Eventually(func(g Gomega) {
 		sub, err := tc.fetchResource(tc.t, gvk.Subscription, subscriptionNN)
 		g.Expect(err).NotTo(HaveOccurred(), "failed to fetch Subscription %s", subscriptionNN)
+
+		actualSource, found, err := unstructured.NestedString(sub.Object, "spec", "source")
+		g.Expect(err).NotTo(HaveOccurred(), "failed to read Subscription %s source", subscriptionNN)
+		g.Expect(found).To(BeTrue(), "Subscription %s has no source", subscriptionNN)
+		g.Expect(actualSource).To(Equal(source), "Subscription %s uses an unexpected catalog", subscriptionNN)
+
+		installPlanName, found, err := unstructured.NestedString(sub.Object, "status", "installPlanRef", "name")
+		g.Expect(err).NotTo(HaveOccurred(), "failed to read Subscription %s installPlanRef", subscriptionNN)
+		g.Expect(found).To(BeTrue(), "Subscription %s has no installPlanRef name", subscriptionNN)
+		g.Expect(installPlanName).NotTo(BeEmpty(), "Subscription %s has an empty installPlanRef name", subscriptionNN)
+
+		installPlanNamespace, _, err := unstructured.NestedString(sub.Object, "status", "installPlanRef", "namespace")
+		g.Expect(err).NotTo(HaveOccurred(), "failed to read Subscription %s installPlanRef namespace", subscriptionNN)
+		if installPlanNamespace == "" {
+			installPlanNamespace = namespace
+		}
 
 		csvName, _, _ := unstructured.NestedString(sub.Object, "status", "currentCSV")
 		if csvName == "" {
 			csvName, _, _ = unstructured.NestedString(sub.Object, "status", "installedCSV")
 		}
 		g.Expect(csvName).NotTo(BeEmpty(), "Subscription %s has no currentCSV or installedCSV", subscriptionNN)
+
+		installPlan, err := tc.fetchResource(tc.t, gvk.InstallPlan, types.NamespacedName{
+			Name:      installPlanName,
+			Namespace: installPlanNamespace,
+		})
+		g.Expect(err).NotTo(HaveOccurred(), "failed to fetch InstallPlan %s/%s", installPlanNamespace, installPlanName)
+		g.Expect(installPlanMatchesSource(installPlan, source, csvName)).To(BeTrue(),
+			"InstallPlan %s/%s must be complete, use catalog %s, and contain CSV %s",
+			installPlanNamespace, installPlanName, source, csvName)
 
 		csv, err := tc.fetchResource(tc.t, gvk.ClusterServiceVersion, types.NamespacedName{
 			Name:      csvName,
@@ -735,11 +873,44 @@ func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types
 		Should(Succeed())
 }
 
+func installPlanMatchesSource(installPlan *unstructured.Unstructured, source, csvName string) bool {
+	planSource, found, err := unstructured.NestedString(installPlan.Object, "spec", "source")
+	if err != nil || !found || planSource != source {
+		return false
+	}
+
+	phase, found, err := unstructured.NestedString(installPlan.Object, "status", "phase")
+	if err != nil || !found || phase != "Complete" {
+		return false
+	}
+
+	csvNames, found, err := unstructured.NestedStringSlice(installPlan.Object, "spec", "clusterServiceVersionNames")
+	return err == nil && found && slices.Contains(csvNames, csvName)
+}
+
 func (tc *TestContext) EnsureOperatorInstalled(namespace, name, channel string) {
 	tc.ensureNamespaceExists(namespace)
 	tc.ensureOperatorGroupExists(namespace, name)
 
 	nn := types.NamespacedName{Name: name, Namespace: namespace}
 	tc.ensureSubscriptionExists(namespace, name, channel)
-	tc.ensureCSVSucceeded(namespace, nn)
+	tc.ensureCSVSucceeded(namespace, nn, "redhat-operators")
+}
+
+func (tc *TestContext) EnsureOperatorInstalledInOwnNamespace(namespace, name, channel string) {
+	tc.ensureNamespaceExists(namespace)
+	tc.ensureOwnNamespaceOperatorGroup(namespace, name)
+
+	nn := types.NamespacedName{Name: name, Namespace: namespace}
+	tc.ensureSubscriptionExists(namespace, name, channel)
+	tc.ensureCSVSucceeded(namespace, nn, "redhat-operators")
+}
+
+func (tc *TestContext) EnsureOperatorInstalledFromCatalog(namespace, name, channel, source string) {
+	tc.ensureNamespaceExists(namespace)
+	tc.ensureOperatorGroupExists(namespace, name)
+
+	nn := types.NamespacedName{Name: name, Namespace: namespace}
+	tc.ensureSubscriptionExistsFromCatalog(namespace, name, channel, source)
+	tc.ensureCSVSucceeded(namespace, nn, source)
 }

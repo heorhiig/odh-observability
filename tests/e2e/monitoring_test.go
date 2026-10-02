@@ -32,11 +32,6 @@ func monitoringTestSuite(t *testing.T) {
 		expectedDefaultReplicas: expectedReplicas,
 	}
 
-	tc.DefaultResourceOpts = []ResourceOpts{
-		WithEventuallyTimeout(5 * time.Minute),
-		WithEventuallyPollingInterval(2 * time.Second),
-	}
-
 	monitoringServiceCtx.ensurePrerequisites(t)
 
 	t.Run("Base Configuration", monitoringServiceCtx.runBaseConfigurationTests)
@@ -152,7 +147,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsConfiguration(t *te
 			jq.Match(`.spec.resources.requests.cpu == "%s"`, MetricsCPURequest),
 			jq.Match(`.spec.resources.requests.memory == "%s"`, MetricsMemoryRequest),
 			jq.Match(`.spec.prometheusConfig.replicas == %d`, tc.expectedDefaultReplicas),
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 		)),
 		WithCustomErrorMsg("MonitoringStack '%s' configuration validation failed", MonitoringStackName),
 	)
@@ -234,7 +229,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testi
 			jq.Match(`.spec.endpoints[0].scheme == "https"`),
 			jq.Match(`.spec.endpoints[0].tlsConfig.ca.configMap.name == "prometheus-web-tls-ca"`),
 			jq.Match(`.metadata.labels."platform.opendatahub.io/part-of" == "monitoring"`),
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 		)),
 		WithCustomErrorMsg("prometheus-self-fixed ServiceMonitor should be created with correct TLS configuration"),
 	)
@@ -280,7 +275,7 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 	)
 
 	ownerRefStableCondition := And(
-		monitoringOwnerReferencesCondition,
+		tc.monitoringOwnerReferencesCondition(),
 		jq.Match(`.metadata.ownerReferences[0].controller == true`),
 	)
 
@@ -297,6 +292,7 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 		{gvk.MonitoringStack, MonitoringStackName, tc.MonitoringNamespace, "MonitoringStack", true, false},
 		{gvk.ClusterRoleBinding, "data-science-monitoringstack-alertmanager-prometheus-metrics-reader", "", "alertmanager ClusterRoleBinding", true, true},
 		{gvk.ClusterRoleBinding, "generate-processors-collector-rolebinding", "", "collector ClusterRoleBinding", false, true},
+		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-rolebinding", "", "TargetAllocator ClusterRoleBinding", false, true},
 		{gvk.Service, "data-science-collector-prometheus", tc.MonitoringNamespace, "collector prometheus Service", true, true},
 		{gvk.ConfigMap, "prometheus-web-tls-ca", tc.MonitoringNamespace, "prometheus TLS CA ConfigMap", true, true},
 	}
@@ -760,7 +756,10 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 		WithCondition(And(
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.spec.targetAllocator.mtls == null`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.denyFSAccessThroughSMs == true`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.secretNamespaces | contains(["%s"])`, tc.MonitoringNamespace),
 			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 		)),
@@ -891,24 +890,47 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 		WithCondition(And(
 			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .resources | contains(["podmonitors", "servicemonitors"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`[.rules[] | select(.apiGroups[] == "") | select(.resources | contains(["secrets"]))] | length == 0`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "") | .resources | contains(["endpoints"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "") | .verbs | contains(["get", "list", "watch"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .resources | contains(["endpointslices"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .verbs | contains(["get", "list", "watch"])`),
 		)),
-		WithCustomErrorMsg("ClusterRole should grant Target Allocator permissions to watch ServiceMonitors, PodMonitors, Endpoints, and EndpointSlices"),
+		WithCustomErrorMsg("collector discovery ClusterRole should not grant Secret access"),
 	)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
-			Name: "generate-processors-collector-rolebinding",
+			Name: "generate-processors-targetallocator-rolebinding",
 		}),
 		WithCondition(And(
 			jq.Match(`.roleRef.name == "generate-processors-role"`),
 			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
-		WithCustomErrorMsg("ClusterRoleBinding should bind Target Allocator ClusterRole to ServiceAccount"),
+		WithCustomErrorMsg("ClusterRoleBinding should bind discovery permissions to the TargetAllocator ServiceAccount"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Role, types.NamespacedName{
+			Name:      "data-science-collector-targetallocator-secrets",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.rules[] | select(.resources | contains(["secrets"])) | .verbs | contains(["get", "list", "watch"])`)),
+		WithCustomErrorMsg("TargetAllocator namespace Role should grant namespaced Secret reads"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.RoleBinding, types.NamespacedName{
+			Name:      "data-science-collector-targetallocator-secrets",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "data-science-collector-targetallocator-secrets"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("TargetAllocator Secret RoleBinding should use the dedicated ServiceAccount"),
 	)
 }
 
@@ -1000,7 +1022,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 			jq.Match(`.spec.selector.matchLabels."platform.opendatahub.io/part-of" == "monitoring"`),
 			jq.Match(`.spec.namespaceSelector.matchNames | contains(["%s"])`, tc.MonitoringNamespace),
 			jq.Match(`.spec.replicaLabels | contains(["prometheus_replica", "rule_replica"])`),
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 		)),
 		WithCustomErrorMsg("ThanosQuerier CR should be created when metrics are configured"),
 	)
@@ -1015,7 +1037,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 			jq.Match(`.metadata.labels."app.kubernetes.io/name" == "thanos-querier"`),
 			jq.Match(`.metadata.labels."app.kubernetes.io/component" == "querier"`),
 			jq.Match(`.metadata.labels."app.kubernetes.io/part-of" == "data-science-monitoring"`),
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 		)),
 		WithCustomErrorMsg("ThanosQuerier Route should be created when metrics are configured"),
 	)
@@ -1032,6 +1054,24 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 		withManagementState(common.Managed),
 		tc.withMetricsConfig(),
 	)
+
+	namespaceProxyIngress := `[.spec.ingress[] |
+  select([.from[]?.podSelector.matchLabels.app]
+    | index("data-science-prometheus-namespace-proxy") != null) |
+  .ports[] |
+  select(.protocol == "TCP" and .port == 9090)] | length == 1`
+	clusterProxyIngress := `[.spec.ingress[] |
+  select([.from[]?.podSelector.matchLabels.app]
+    | index("data-science-prometheus-cluster-proxy") != null) |
+  .ports[] |
+  select(.protocol == "TCP" and .port == 9090)] | length == 1`
+	thanosQuerierIngress := `[.spec.ingress[] |
+  select(( [.from[]?.podSelector.matchLabels]
+    | map(select(.["app.kubernetes.io/part-of"] == "ThanosQuerier"
+      and .["app.kubernetes.io/managed-by"] == "observability-operator"))
+    | length) > 0) |
+  .ports[] |
+  select(.protocol == "TCP" and .port == 10901)] | length == 1`
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
@@ -1052,15 +1092,10 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 			jq.Match(`.metadata.labels["platform.opendatahub.io/part-of"] == "monitoring"`),
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/name"] == "prometheus"`),
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/instance"] == "data-science-monitoringstack"`),
-			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
-			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels.app == "data-science-prometheus-namespace-proxy"`),
-			jq.Match(`.spec.ingress[0].from[1].podSelector.matchLabels.app == "data-science-prometheus-cluster-proxy"`),
-			jq.Match(`.spec.ingress[0].ports[0].protocol == "TCP"`),
-			jq.Match(`.spec.ingress[0].ports[0].port == 9090`),
-			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/part-of"] == "ThanosQuerier"`),
-			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/managed-by"] == "observability-operator"`),
-			jq.Match(`.spec.ingress[1].ports[0].protocol == "TCP"`),
-			jq.Match(`.spec.ingress[1].ports[0].port == 10901`),
+			jq.Match(`.spec.policyTypes | contains(["Ingress"])`),
+			jq.Match("%s", namespaceProxyIngress),
+			jq.Match("%s", clusterProxyIngress),
+			jq.Match("%s", thanosQuerierIngress),
 		)),
 		WithCustomErrorMsg("Prometheus NetworkPolicy should allow Thanos Querier ingress on gRPC port 10901"),
 	)
@@ -1154,7 +1189,7 @@ func (tc *MonitoringTestCtx) ValidateCollectorMLflowIntegrationRBAC(t *testing.T
 			jq.Match(`.roleRef.name == "data-science-collector-mlflow-trace-export"`),
 			jq.Match(`(.subjects | length) == 1`),
 			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
-			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].name == "%s"`, CollectorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to MLflow trace export ClusterRole"),
@@ -1217,7 +1252,7 @@ func (tc *MonitoringTestCtx) ValidateCollectorTempoTraceExportRBAC(t *testing.T)
 			jq.Match(`.roleRef.name == "data-science-collector-tempo-trace-export"`),
 			jq.Match(`(.subjects | length) == 1`),
 			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
-			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].name == "%s"`, CollectorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to Tempo trace export ClusterRole"),
@@ -1307,12 +1342,27 @@ func (tc *MonitoringTestCtx) validateTempoStackCreationAndPersesTLS(t *testing.T
 	tc = tc.WithT(t)
 
 	secretName := fmt.Sprintf("%s-secret", backend)
+	t.Cleanup(func() {
+		switch backend {
+		case TracesStorageBackendS3:
+			tc.cleanupSeaweedFS()
+		case TracesStorageBackendGCS:
+			tc.cleanupFakeGCS()
+		}
+	})
+	t.Cleanup(func() { tc.cleanupTempoStackAndSecret(secretName) })
+	t.Cleanup(tc.cleanupTracesConfiguration)
 
 	tc.validateTempoStackCreation(t, backend, secretName, monitoringCondition, monitoringErrorMsg)
 	tc.validatePersesDatasourceTLS(t, backend, secretName)
-
-	tc.cleanupTracesConfiguration()
-	tc.cleanupTempoStackAndSecret(secretName)
+	if backend == TracesStorageBackendGCS {
+		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/storage/v1/", fakeGCSServiceName, tc.MonitoringNamespace, fakeGCSPort)
+		tc.EnsureResourceExistsConsistently(
+			WithMinimalObject(gvk.TempoStack, types.NamespacedName{Name: TempoStackName, Namespace: tc.MonitoringNamespace}),
+			WithCondition(jq.Match(`.spec.extraConfig.tempo.storage.trace.gcs.endpoint == "%s"`, endpoint)),
+			WithCustomErrorMsg("TempoStack should retain the fake GCS endpoint across monitoring reconciliation"),
+		)
+	}
 }
 
 // validateTempoStackCreation creates a secret, enables traces for the given backend,
@@ -1323,9 +1373,17 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 
 	tc.ensureMonitoringCleanSlate(t, secretName)
 
-	tc.createDummySecret(t, backend, secretName, tc.MonitoringNamespace)
+	switch backend {
+	case TracesStorageBackendS3:
+		tc.startSeaweedFS(t, tempoS3Bucket)
+	case TracesStorageBackendGCS:
+		tc.startFakeGCS(t)
+	default:
+		t.Fatalf("unsupported Tempo storage backend %q", backend)
+	}
+	tc.createTempoStorageSecret(t, backend, secretName, tc.MonitoringNamespace)
 
-	tc.updateMonitoringConfig(
+	tc.updateMonitoringConfigWithoutReady(
 		withManagementState(common.Managed),
 		withMonitoringTraces(backend, secretName, "", DefaultRetention),
 	)
@@ -1336,11 +1394,28 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 		WithCustomErrorMsg(monitoringErrorMsg),
 	)
 
+	tempoStack := types.NamespacedName{Name: TempoStackName, Namespace: tc.MonitoringNamespace}
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.TempoStack, types.NamespacedName{
-			Name:      TempoStackName,
-			Namespace: tc.MonitoringNamespace,
-		}),
+		WithMinimalObject(gvk.TempoStack, tempoStack),
+		WithCondition(And(
+			jq.Match(`.spec.storage.secret.type == "%s"`, backend),
+			jq.Match(`.spec.storage.secret.name == "%s"`, secretName),
+		)),
+		WithEventuallyTimeout(15*time.Minute),
+	)
+
+	if backend == TracesStorageBackendGCS {
+		tc.EventuallyResourcePatched(
+			WithMinimalObject(gvk.TempoStack, tempoStack),
+			WithMutateFunc(jq.Transform(`.spec.extraConfig.tempo.storage.trace.gcs = {
+				"endpoint": "http://%s.%s.svc.cluster.local:%d/storage/v1/",
+				"insecure": true
+			}`, fakeGCSServiceName, tc.MonitoringNamespace, fakeGCSPort)),
+		)
+	}
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.TempoStack, tempoStack),
 		WithCondition(And(
 			jq.Match(`.spec.storage.secret.type == "%s"`, backend),
 			jq.Match(`.spec.storage.secret.name == "%s"`, secretName),
@@ -1350,6 +1425,20 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 		WithEventuallyTimeout(15*time.Minute),
 		WithCustomErrorMsg("TempoStack should be created by controller with %s backend", backend),
 	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue)),
+		WithEventuallyTimeout(15*time.Minute),
+		WithCustomErrorMsg("Monitoring should become Ready with %s traces storage", backend),
+	)
+	if backend == TracesStorageBackendGCS {
+		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/storage/v1/", fakeGCSServiceName, tc.MonitoringNamespace, fakeGCSPort)
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.TempoStack, tempoStack),
+			WithCondition(jq.Match(`.spec.extraConfig.tempo.storage.trace.gcs.endpoint == "%s"`, endpoint)),
+			WithCustomErrorMsg("TempoStack should keep the fake GCS endpoint after reconciliation"),
+		)
+	}
 }
 
 // validatePersesDatasourceTLS enables TLS on the existing traces configuration and validates
@@ -1412,7 +1501,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 				(.spec.sampler.type == "traceidratio") and
 				(.spec.sampler.argument == "0.1")
 			`, expectedEndpoint),
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 		)),
 		WithCustomErrorMsg("Instrumentation CR should be created with correct configuration and owner references"),
 	)
@@ -1495,7 +1584,7 @@ func (tc *MonitoringTestCtx) ValidatePersesCRCreation(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Perses, types.NamespacedName{Name: PersesName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.spec.containerPort == 8080`),
 			jq.Match(`.spec.config.database.file.folder == "/perses"`),
 			jq.Match(`.spec.config.database.file.extension == "yaml"`),
@@ -1655,6 +1744,8 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
 			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-cluster-observability-operator"`),
 			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
+			jq.Match(`.spec.ingress[0].from[1].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-operators"`),
+			jq.Match(`.spec.ingress[0].from[1].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
 			jq.Match(`.spec.ingress[0].ports[0].protocol == "TCP"`),
 			jq.Match(`.spec.ingress[0].ports[0].port == 8080`),
 		)),
@@ -1738,7 +1829,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceConfiguration(t *testing.T)
 		WithCondition(And(
 			jq.Match(`.metadata.ownerReferences | length == 1`),
 			jq.Match(`.metadata.ownerReferences[0].kind == "%s"`, gvk.Monitoring.Kind),
-			jq.Match(`.metadata.ownerReferences[0].name == "%s"`, MonitoringCRName),
+			jq.Match(`.metadata.ownerReferences[0].name == "%s"`, tc.MonitoringCRName),
 		)),
 	)
 
@@ -1768,7 +1859,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.spec.config.default == false`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
@@ -1781,7 +1872,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			monitoringOwnerReferencesCondition,
+			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.spec.config.default == true`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
@@ -2233,20 +2324,19 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 	tc.resetMonitoringConfigToRemoved()
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: MonitoringCRName}),
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseNotReady)),
 		WithCustomErrorMsg("Monitoring CR should be in Not Ready phase after setting managementState=Removed"),
 	)
 
 	for _, resource := range []struct {
-		gvk                schema.GroupVersionKind
-		name               string
-		namespace          string
-		forceWithFinalizer bool
+		gvk       schema.GroupVersionKind
+		name      string
+		namespace string
 	}{
-		{gvk: gvk.MonitoringStack, name: MonitoringStackName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
-		{gvk: gvk.TempoStack, name: TempoStackName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
-		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
+		{gvk: gvk.MonitoringStack, name: MonitoringStackName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.TempoStack, name: TempoStackName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.OpenTelemetryCollector, name: OpenTelemetryCollectorName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.OpenTelemetryCollector, name: UsageLogsCollectorName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.Instrumentation, name: InstrumentationName, namespace: tc.MonitoringNamespace},
@@ -2254,23 +2344,11 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName, namespace: tc.MonitoringNamespace},
 	} {
-		if resource.forceWithFinalizer {
-			tc.DeleteResource(
-				WithMinimalObject(resource.gvk, types.NamespacedName{
-					Name:      resource.name,
-					Namespace: resource.namespace,
-				}),
-				WithWaitForDeletion(true),
-				WithRemoveFinalizersOnDelete(true),
-				WithIgnoreNotFound(true),
-			)
-		} else {
-			tc.EnsureResourceGone(
-				WithMinimalObject(resource.gvk, types.NamespacedName{
-					Name:      resource.name,
-					Namespace: resource.namespace,
-				}),
-			)
-		}
+		tc.EnsureResourceGone(
+			WithMinimalObject(resource.gvk, types.NamespacedName{
+				Name:      resource.name,
+				Namespace: resource.namespace,
+			}),
+		)
 	}
 }

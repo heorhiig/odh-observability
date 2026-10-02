@@ -23,7 +23,10 @@ The operator watches a singleton `Monitoring` CR (`services.platform.opendatahub
 
 - Go 1.26+
 - An OpenShift cluster with `KUBECONFIG` configured
-- One or more of: Cluster Observability Operator, Tempo Operator, OpenTelemetry Operator, cert-manager
+- OpenTelemetry Operator for metrics; Cluster Observability Operator for built-in metrics storage
+- OpenTelemetry Operator for traces; Tempo Operator for built-in trace storage
+- OpenTelemetry Operator and Loki Operator for usage logs
+- cert-manager for the mutating webhook
 
 ### Build
 
@@ -104,13 +107,13 @@ go test ./internal/controller/ -run TestBuildTemplateData -v
 Requires a live cluster with `KUBECONFIG` set:
 
 ```bash
-make e2e-test
+make e2e-test-monitoring
 ```
 
 Or with flags:
 
 ```bash
-go test ./tests/e2e/ -v -timeout 120m -count=1 \
+go test ./tests/e2e/ -v -timeout 120m -count=1 -run '^TestMonitoring$' \
   -monitoring-namespace=opendatahub \
   -install-operators=true \
   -eventually-timeout=5m

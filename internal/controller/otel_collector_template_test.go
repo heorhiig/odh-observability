@@ -56,6 +56,9 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	if strings.Contains(relabelSection, "__name__") {
 		t.Error("relabel_configs must not reference __name__ (unavailable at target-discovery stage)")
 	}
+	if strings.Contains(metricRelabelSection, "__tmp_scale_needed") {
+		t.Error("metric_relabel_configs must not add __tmp_scale_needed (rejected by OTel prometheus exporter)")
+	}
 	if strings.Contains(metricRelabelSection, "target_label: __name__") {
 		t.Error("DCGM metric names must not be renamed in metric_relabel_configs")
 	}
@@ -68,6 +71,87 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	expectedKeepRegex := "(" + strings.Join(dcgmMetrics, "|") + ")"
 	if !strings.Contains(keepRule, "action: keep") || !strings.Contains(keepRule, "regex: '"+expectedKeepRegex+"'") {
 		t.Error("DCGM metrics must be included in the final keep list")
+	}
+}
+
+//nolint:gocyclo // The test validates the complete rendered scrape configuration.
+func TestPrometheusScrapeConfigExcludesEPPSchedulerPods(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
+	if err != nil || !found {
+		t.Fatalf("target allocator config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	if _, found, err := unstructured.NestedMap(targetAllocator, "mtls"); err != nil || found {
+		t.Fatalf("target allocator mTLS must be omitted for the non-mTLS metrics path: found=%t, error=%v", found, err)
+	}
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	if err != nil || !found {
+		t.Fatalf("prometheus scrape configs must be present: found=%t, error=%v", found, err)
+	}
+
+	var podScrapeJob map[string]any
+	for _, rawScrapeConfig := range scrapeConfigs {
+		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
+		if ok && scrapeConfig["job_name"] == "data-science-collector-prometheus" {
+			podScrapeJob = scrapeConfig
+			break
+		}
+	}
+	if podScrapeJob == nil {
+		t.Fatal("data-science-collector-prometheus scrape config must be present")
+	}
+
+	relabelConfigs, found, err := unstructured.NestedSlice(podScrapeJob, "relabel_configs")
+	if err != nil || !found {
+		t.Fatalf("pod scrape relabel configs must be present: found=%t, error=%v", found, err)
+	}
+
+	var hasDefaultPort, hasEPPSchedulerDrop, hasEPPPort bool
+	for _, rawRule := range relabelConfigs {
+		rule, ok := rawRule.(map[string]any)
+		if !ok {
+			t.Fatal("pod scrape relabel rule has unexpected type")
+		}
+		if rule["action"] == "drop" && rule["regex"] == "llminferenceservice-router-scheduler" {
+			sourceLabels, ok := rule["source_labels"].([]any)
+			if !ok || !containsString(sourceLabels, "__meta_kubernetes_pod_label_app_kubernetes_io_component") {
+				t.Errorf("EPP exclusion must inspect the scheduler component label: %v", rule)
+			}
+			hasEPPSchedulerDrop = true
+		}
+		switch rule["replacement"] {
+		case "$1:8080":
+			hasDefaultPort = true
+		case "$1:9090":
+			hasEPPPort = true
+		}
+	}
+
+	if !hasDefaultPort {
+		t.Error("pod scrape config must retain the default 8080 port")
+	}
+	if !hasEPPSchedulerDrop {
+		t.Error("pod scrape config must exclude scheduler pods handled by KServe's ServiceMonitor")
+	}
+	if hasEPPPort {
+		t.Error("pod scrape config must not add a second EPP metrics port")
+	}
+
+	prometheusCR, found, err := unstructured.NestedMap(targetAllocator, "prometheusCR")
+	if err != nil || !found || prometheusCR["denyFSAccessThroughSMs"] != true {
+		t.Fatalf("target allocator must deny ServiceMonitor filesystem access: found=%t, config=%v, error=%v", found, prometheusCR, err)
+	}
+	if targetAllocator["serviceAccount"] != targetAllocatorServiceAccountName {
+		t.Errorf("target allocator must use dedicated service account %q, got %v", targetAllocatorServiceAccountName, targetAllocator["serviceAccount"])
+	}
+	secretNamespaces, ok := prometheusCR["secretNamespaces"].([]any)
+	if !ok || len(secretNamespaces) != 2 || secretNamespaces[0] != "redhat-ods-monitoring" || secretNamespaces[1] != "team-a" {
+		t.Errorf("target allocator must receive the rendered Secret namespace allowlist, got %v", prometheusCR["secretNamespaces"])
 	}
 }
 
@@ -178,20 +262,22 @@ func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 		FS:   resourcesFS,
 		Path: OpenTelemetryCollectorTemplate,
 	}}, map[string]any{
-		"Namespace":              "redhat-ods-monitoring",
-		"Metrics":                true,
-		"MetricsStorage":         true,
-		"AcceleratorMetrics":     true,
-		"Traces":                 false,
-		"CollectorReplicas":      1,
-		"CollectorCPULimit":      "1",
-		"CollectorMemoryLimit":   "1Gi",
-		"CollectorCPURequest":    "100m",
-		"CollectorMemoryRequest": "256Mi",
-		"MetricsExporterNames":   []string{},
-		"MetricsExporters":       map[string]string{},
-		"TracesExporterNames":    []string{},
-		"TracesExporters":        map[string]string{},
+		"Namespace":                       "redhat-ods-monitoring",
+		"Metrics":                         true,
+		"MetricsStorage":                  true,
+		"AcceleratorMetrics":              true,
+		"Traces":                          false,
+		"CollectorReplicas":               1,
+		"CollectorCPULimit":               "1",
+		"CollectorMemoryLimit":            "1Gi",
+		"CollectorCPURequest":             "100m",
+		"CollectorMemoryRequest":          "256Mi",
+		"MetricsExporterNames":            []string{},
+		"MetricsExporters":                map[string]string{},
+		"TargetAllocatorServiceAccount":   targetAllocatorServiceAccountName,
+		"TargetAllocatorSecretNamespaces": []string{"redhat-ods-monitoring", "team-a"},
+		"TracesExporterNames":             []string{},
+		"TracesExporters":                 map[string]string{},
 	})
 	if err != nil {
 		t.Fatalf("collector template must render as valid YAML: %v", err)
