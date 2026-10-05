@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -1998,7 +1999,8 @@ func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *
 		}),
 		WithCondition(And(
 			jq.Match(`.status.readyReplicas == 1`),
-			jq.Match(`.spec.template.spec.containers | length == 2`),
+			jq.Match(`.spec.template.spec.containers | length == 3`),
+			jq.Match(`[.spec.template.spec.containers[].name] | contains(["kube-rbac-proxy", "method-gate", "prom-label-proxy"])`),
 		)),
 		WithCustomErrorMsg("data-science-prometheus-namespace-proxy deployment should be created and ready"),
 	)
@@ -2295,11 +2297,46 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 		WithCondition(And(
 			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param=namespace"])`),
 			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--error-on-replace"])`),
+			// Defense-in-depth: a method gate rejects non-GET/HEAD before prom-label-proxy,
+			// and kube-rbac-proxy forwards to it (:9092) rather than to prom-label-proxy (:9091).
+			jq.Match(`[.spec.template.spec.containers[].name] | contains(["method-gate"])`),
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "kube-rbac-proxy") | .args | contains(["--upstream=http://127.0.0.1:9092/"])`),
 		)),
-		WithCustomErrorMsg("prom-label-proxy must have --query-param=namespace and --error-on-replace flags"),
+		WithCustomErrorMsg("namespace proxy must have the method gate and route kube-rbac-proxy through it"),
 	)
 
-	t.Log("POST-body namespace bypass is closed: no ClusterRole grants 'create' on metrics.k8s.io/pods, so POST is rejected (403) at kube-rbac-proxy before reaching prom-label-proxy")
+	t.Log("POST-body namespace bypass is closed: the method gate rejects non-GET/HEAD (403) before prom-label-proxy, independent of RBAC")
+
+	host := tc.routeHost(t, "data-science-prometheus-route")
+
+	// Behavioral proof #1 (RBAC layer): a token authorized only for GET (verb "get")
+	// on pods.metrics.k8s.io issues a POST with the namespace in both the URL query
+	// (allowed) and the form body ("secret"). POST maps to the "create" verb, which
+	// the token lacks, so kube-rbac-proxy rejects it with 403.
+	getOnlyToken := tc.mintScopedMetricsGetToken(t, tc.MonitoringNamespace)
+
+	// Behavioral proof #2 (method gate, independent of RBAC): the suite's admin token
+	// CAN "create", so without the gate kube-rbac-proxy would authorize this POST.
+	// The method gate must still reject it with 403, proving enforcement does not
+	// depend on the absence of a "create" grant.
+	adminToken := getAuthToken(tc.TestContext)
+
+	g := NewWithT(t)
+	g.Eventually(func(g Gomega) {
+		status, err := postPromQLForm(tc.Context(), host, getOnlyToken, tc.MonitoringNamespace, "openshift-monitoring")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(status).To(Equal(http.StatusForbidden),
+			"POST with a get-only token must be rejected with 403; got %d", status)
+	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+	if adminToken != "" {
+		g.Eventually(func(g Gomega) {
+			status, err := postPromQLForm(tc.Context(), host, adminToken, tc.MonitoringNamespace, "openshift-monitoring")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(status).To(Equal(http.StatusForbidden),
+				"POST with a create-capable token must still be rejected with 403 by the method gate; got %d", status)
+		}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+	}
 }
 
 // ========================================================================

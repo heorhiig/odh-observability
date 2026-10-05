@@ -223,12 +223,14 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		t.Fatalf("namespace proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("namespace proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("namespace proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
+	// kube-rbac-proxy must forward to the method gate (:9092), not directly to
+	// prom-label-proxy (:9091), so GET/HEAD enforcement runs before label proxying.
 	assertContainerArgs(t, asMap(t, containers[0]),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -240,6 +242,25 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--label=namespace",
 		"--enable-label-apis",
 	)
+
+	// The method gate must be present (findContainer fails the test otherwise) and
+	// enforce GET/HEAD only, independent of RBAC.
+	findContainer(t, containers, "method-gate")
+	gateConfigMap := findRenderedResource(t, resources, "ConfigMap", "data-science-prometheus-namespace-proxy-method-gate")
+	gateConfig, found, err := unstructured.NestedString(gateConfigMap.Object, "data", "nginx.conf")
+	if err != nil || !found {
+		t.Fatalf("method-gate nginx config is missing: found=%t error=%v", found, err)
+	}
+	for _, expected := range []string{
+		"limit_except GET HEAD",
+		"deny all;",
+		"listen 127.0.0.1:9092;",
+		"proxy_pass http://127.0.0.1:9091;",
+	} {
+		if !strings.Contains(gateConfig, expected) {
+			t.Errorf("method-gate config must contain %q, got %q", expected, gateConfig)
+		}
+	}
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-namespace-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -526,6 +547,7 @@ func proxyTemplateData() map[string]any {
 		"Namespace":           testMonitoringNamespace,
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
+		"HTTPMethodGateImage": "example.invalid/method-gate:test",
 		"TLSMinVersion":       "VersionTLS12",
 		"TLSCipherSuites":     "",
 	}

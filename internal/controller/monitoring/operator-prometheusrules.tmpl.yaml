@@ -95,7 +95,7 @@ spec:
             rate(controller_runtime_webhook_requests_total{
               namespace="{{ .OperatorNamespace }}",
               pod=~"{{ .OperatorPodPrefix }}.*",
-              result="error"
+              code="500"
             }[5m]) > 0
           for: 2m
           labels:
