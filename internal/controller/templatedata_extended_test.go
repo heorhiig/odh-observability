@@ -905,7 +905,7 @@ func TestAddResourceData(t *testing.T) {
 func TestAddImageURLs_Defaults(t *testing.T) {
 	os.Unsetenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE")
 	os.Unsetenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE")
-	os.Unsetenv("RELATED_IMAGE_ODH_HTTP_METHOD_GATE_IMAGE")
+	os.Unsetenv("OPERATOR_IMAGE")
 
 	data := make(map[string]any)
 	addImageURLs(data)
@@ -924,7 +924,7 @@ func TestAddImageURLs_Defaults(t *testing.T) {
 func TestAddImageURLs_OverriddenByEnv(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE", "custom-proxy:latest")
 	t.Setenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", "custom-prom-proxy:latest")
-	t.Setenv("RELATED_IMAGE_ODH_HTTP_METHOD_GATE_IMAGE", "custom-method-gate:latest")
+	t.Setenv("OPERATOR_IMAGE", "custom-method-gate:latest")
 
 	data := make(map[string]any)
 	addImageURLs(data)

@@ -2109,7 +2109,8 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *test
 		}),
 		WithCondition(And(
 			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream="))) | length == 1`),
-			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9091/"))) | length == 1`),
+			// kube-rbac-proxy forwards to the method gate (:9092), not directly to prom-label-proxy (:9091).
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9092/"))) | length == 1`),
 			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--secure-listen-address=0.0.0.0:8443"))) | length == 1`),
 		)),
 		WithCustomErrorMsg("kube-rbac-proxy should be configured with correct upstream and secure listen address"),
@@ -2315,11 +2316,13 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 	// the token lacks, so kube-rbac-proxy rejects it with 403.
 	getOnlyToken := tc.mintScopedMetricsGetToken(t, tc.MonitoringNamespace)
 
-	// Behavioral proof #2 (method gate, independent of RBAC): the suite's admin token
-	// CAN "create", so without the gate kube-rbac-proxy would authorize this POST.
-	// The method gate must still reject it with 403, proving enforcement does not
-	// depend on the absence of a "create" grant.
-	adminToken := getAuthToken(tc.TestContext)
+	// Behavioral proof #2 (method gate, independent of RBAC): a token authorized for
+	// "create" on pods.metrics.k8s.io in the URL-query namespace. kube-rbac-proxy maps
+	// POST -> create and WOULD authorize this POST, so the only thing that can reject it
+	// is the method gate. Asserting 403 proves the gate enforces GET/HEAD regardless of
+	// RBAC grants. Minted explicitly (not the optional admin token) so the check is
+	// deterministic and never silently skipped.
+	createToken := tc.mintScopedMetricsCreateToken(t, tc.MonitoringNamespace)
 
 	g := NewWithT(t)
 	g.Eventually(func(g Gomega) {
@@ -2329,14 +2332,12 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 			"POST with a get-only token must be rejected with 403; got %d", status)
 	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 
-	if adminToken != "" {
-		g.Eventually(func(g Gomega) {
-			status, err := postPromQLForm(tc.Context(), host, adminToken, tc.MonitoringNamespace, "openshift-monitoring")
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(status).To(Equal(http.StatusForbidden),
-				"POST with a create-capable token must still be rejected with 403 by the method gate; got %d", status)
-		}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
-	}
+	g.Eventually(func(g Gomega) {
+		status, err := postPromQLForm(tc.Context(), host, createToken, tc.MonitoringNamespace, "openshift-monitoring")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(status).To(Equal(http.StatusForbidden),
+			"POST with a create-capable token must still be rejected with 403 by the method gate; got %d", status)
+	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 }
 
 // ========================================================================

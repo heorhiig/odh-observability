@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -244,21 +245,30 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	)
 
 	// The method gate must be present (findContainer fails the test otherwise) and
-	// enforce GET/HEAD only, independent of RBAC.
-	findContainer(t, containers, "method-gate")
-	gateConfigMap := findRenderedResource(t, resources, "ConfigMap", "data-science-prometheus-namespace-proxy-method-gate")
-	gateConfig, found, err := unstructured.NestedString(gateConfigMap.Object, "data", "nginx.conf")
-	if err != nil || !found {
-		t.Fatalf("method-gate nginx config is missing: found=%t error=%v", found, err)
+	// run the operator binary's "method-gate" subcommand, listening on :9092 and
+	// forwarding to prom-label-proxy on :9091. GET/HEAD enforcement is implemented
+	// in that subcommand, independent of RBAC.
+	gate := findContainer(t, containers, "method-gate")
+	gateCommand, ok := gate["command"].([]any)
+	if !ok {
+		t.Fatalf("method-gate command has unexpected type %T", gate["command"])
+	}
+	gateCommandStrs := make([]string, 0, len(gateCommand))
+	for _, c := range gateCommand {
+		s, ok := c.(string)
+		if !ok {
+			t.Fatalf("method-gate command element has unexpected type %T", c)
+		}
+		gateCommandStrs = append(gateCommandStrs, s)
 	}
 	for _, expected := range []string{
-		"limit_except GET HEAD",
-		"deny all;",
-		"listen 127.0.0.1:9092;",
-		"proxy_pass http://127.0.0.1:9091;",
+		"/manager",
+		"method-gate",
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
 	} {
-		if !strings.Contains(gateConfig, expected) {
-			t.Errorf("method-gate config must contain %q, got %q", expected, gateConfig)
+		if !slices.Contains(gateCommandStrs, expected) {
+			t.Errorf("method-gate command must contain %q, got %v", expected, gateCommandStrs)
 		}
 	}
 

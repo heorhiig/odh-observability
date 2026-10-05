@@ -1,8 +1,10 @@
 # Namespace-scoped Prometheus proxy.
 #
-# Only GET and HEAD are allowed. A method-gate sidecar (nginx) sits between
+# Only GET and HEAD are allowed. A method-gate sidecar sits between
 # kube-rbac-proxy and prom-label-proxy and returns 403 for every other method
-# BEFORE the request reaches prom-label-proxy. This enforcement is independent
+# BEFORE the request reaches prom-label-proxy. The gate runs the operator's own
+# image ("manager method-gate" subcommand), so no extra container image has to be
+# shipped or mirrored for disconnected installs. This enforcement is independent
 # of RBAC: even if a role were ever to grant users "create" on
 # metrics.k8s.io/pods (which would make kube-rbac-proxy authorize a POST), the
 # gate still rejects the request.
@@ -82,46 +84,6 @@ data:
         resource: pods
         namespace: "{{ "{{ .Value }}" }}"
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: data-science-prometheus-namespace-proxy-method-gate
-  namespace: {{.Namespace}}
-  labels:
-    app: data-science-prometheus-namespace-proxy
-    platform.opendatahub.io/part-of: monitoring
-data:
-  # Minimal reverse proxy that allows only GET/HEAD and forwards to
-  # prom-label-proxy. Any other method returns 403 regardless of RBAC. All
-  # runtime-writable paths are redirected under /tmp so the container can run
-  # with a read-only root filesystem and an arbitrary (non-root) UID.
-  nginx.conf: |
-    worker_processes 1;
-    pid /tmp/nginx.pid;
-    error_log /dev/stderr warn;
-    events {
-      worker_connections 1024;
-    }
-    http {
-      access_log /dev/stdout;
-      client_body_temp_path /tmp/client_temp;
-      proxy_temp_path /tmp/proxy_temp;
-      fastcgi_temp_path /tmp/fastcgi_temp;
-      uwsgi_temp_path /tmp/uwsgi_temp;
-      scgi_temp_path /tmp/scgi_temp;
-      server {
-        listen 127.0.0.1:9092;
-        location / {
-          limit_except GET HEAD {
-            deny all;
-          }
-          proxy_pass http://127.0.0.1:9091;
-          proxy_set_header Host $host;
-          proxy_set_header Authorization $http_authorization;
-        }
-      }
-    }
----
 #
 # REQUIRED QUERY FORMAT: /api/v1/query?query=<promql>&namespace=<namespace-name>
 #
@@ -194,12 +156,14 @@ spec:
         # independent of RBAC, before prom-label-proxy parses the request.
         - name: method-gate
           image: {{.HTTPMethodGateImage}}
+          # Runs the operator binary's "method-gate" subcommand: a minimal reverse
+          # proxy that forwards only GET/HEAD to prom-label-proxy and returns 403
+          # for everything else. No config file or writable filesystem needed.
           command:
-            - nginx
-            - -c
-            - /etc/nginx/nginx.conf
-            - -g
-            - "daemon off;"
+            - /manager
+            - method-gate
+            - --listen=127.0.0.1:9092
+            - --upstream=http://127.0.0.1:9091
           ports:
             - containerPort: 9092
               name: method-gate
@@ -212,13 +176,6 @@ spec:
               cpu: 50m
               memory: 64Mi
           terminationMessagePolicy: FallbackToLogsOnError
-          volumeMounts:
-            - name: method-gate-config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
-              readOnly: true
-            - name: method-gate-tmp
-              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -261,11 +218,6 @@ spec:
         - name: config
           configMap:
             name: data-science-prometheus-namespace-proxy-config
-        - name: method-gate-config
-          configMap:
-            name: data-science-prometheus-namespace-proxy-method-gate
-        - name: method-gate-tmp
-          emptyDir: {}
         - name: tls
           secret:
             secretName: data-science-prometheus-namespace-proxy-tls

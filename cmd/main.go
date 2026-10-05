@@ -60,6 +60,18 @@ func init() {
 }
 
 func main() {
+	// The "method-gate" subcommand runs a minimal read-only reverse proxy that
+	// only forwards GET/HEAD (see runMethodGate). It reuses this operator image as
+	// a sidecar, so no extra container image has to be shipped for disconnected
+	// installs. It must be handled before the controller-manager flag setup below.
+	if len(os.Args) > 1 && os.Args[1] == "method-gate" {
+		if err := runMethodGate(os.Args[2:]); err != nil {
+			ctrl.Log.WithName("method-gate").Error(err, "method gate failed")
+			os.Exit(1)
+		}
+		return
+	}
+
 	var (
 		metricsAddr    string
 		probeAddr      string

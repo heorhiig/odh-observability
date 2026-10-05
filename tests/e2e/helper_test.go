@@ -911,8 +911,24 @@ var (
 // rejected for POST. Created RBAC is removed via t.Cleanup.
 func (tc *MonitoringTestCtx) mintScopedMetricsGetToken(t *testing.T, namespace string) string {
 	t.Helper()
+	// Only "get": "create" is omitted so POST (verb "create") is denied at the RBAC layer.
+	return tc.mintScopedMetricsToken(t, "ns-isolation-probe-get", namespace, "get")
+}
 
-	const name = "ns-isolation-probe"
+// mintScopedMetricsCreateToken provisions a ServiceAccount authorized for "create"
+// on pods.metrics.k8s.io in the given namespace and returns a bearer token for it.
+// POST maps to the SAR verb "create", so kube-rbac-proxy WOULD authorize a POST
+// whose URL-query namespace matches this grant. Used to prove the method gate
+// rejects POST (403) independently of RBAC. Created RBAC is removed via t.Cleanup.
+func (tc *MonitoringTestCtx) mintScopedMetricsCreateToken(t *testing.T, namespace string) string {
+	t.Helper()
+	return tc.mintScopedMetricsToken(t, "ns-isolation-probe-create", namespace, "create")
+}
+
+// mintScopedMetricsToken provisions a ServiceAccount + namespaced Role/RoleBinding
+// granting the given verbs on pods.metrics.k8s.io and returns a bearer token for it.
+func (tc *MonitoringTestCtx) mintScopedMetricsToken(t *testing.T, name, namespace string, verbs ...string) string {
+	t.Helper()
 
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -922,8 +938,7 @@ func (tc *MonitoringTestCtx) mintScopedMetricsGetToken(t *testing.T, namespace s
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{"metrics.k8s.io"},
 			Resources: []string{"pods"},
-			// Deliberately only "get": "create" is omitted so POST (verb "create") is denied.
-			Verbs: []string{"get"},
+			Verbs:     verbs,
 		}},
 	}
 	rb := &rbacv1.RoleBinding{

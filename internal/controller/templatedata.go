@@ -592,15 +592,17 @@ func addImageURLs(templateData map[string]any) {
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
-	// HTTPMethodGateImage is a minimal reverse proxy (nginx) that rejects any method
-	// other than GET/HEAD before the request reaches prom-label-proxy. This enforces
-	// read-only access at the proxy layer independent of RBAC, so a POST-body
-	// "namespace" value can never be merged into the enforced label matcher even if a
-	// role were ever to grant "create" on metrics.k8s.io/pods. Release manifests
-	// should pin this via the RELATED_IMAGE contract.
+	// HTTPMethodGateImage runs the "method-gate" subcommand of this operator binary
+	// as a sidecar: a minimal reverse proxy that rejects any method other than
+	// GET/HEAD before the request reaches prom-label-proxy. This enforces read-only
+	// access at the proxy layer independent of RBAC, so a POST-body "namespace" value
+	// can never be merged into the enforced label matcher even if a role were ever to
+	// grant "create" on metrics.k8s.io/pods. Reusing the operator image means no extra
+	// image has to be shipped or mirrored for disconnected installs; OPERATOR_IMAGE is
+	// set on the operator Deployment to the operator's own (pinned, mirrored) image.
 	templateData["HTTPMethodGateImage"] = getEnvOrDefault(
-		"RELATED_IMAGE_ODH_HTTP_METHOD_GATE_IMAGE",
-		"registry.redhat.io/ubi9/nginx-124:latest",
+		"OPERATOR_IMAGE",
+		"quay.io/opendatahub/odh-observability:odh-stable",
 	)
 }
 
