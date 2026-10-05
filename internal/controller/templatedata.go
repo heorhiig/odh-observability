@@ -602,7 +602,7 @@ func addImageURLs(templateData map[string]any) {
 	// set on the operator Deployment to the operator's own (pinned, mirrored) image.
 	templateData["HTTPMethodGateImage"] = getEnvOrDefault(
 		"OPERATOR_IMAGE",
-		"quay.io/opendatahub/odh-observability:odh-stable",
+		"quay.io/opendatahub/odh-observability@sha256:e18a0beefbe02c535c0acf277a17f8c37302de94bfb70f7e2d713f2689b18498",
 	)
 }
 
