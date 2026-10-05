@@ -1112,7 +1112,7 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 		}
 		defer resp.Body.Close()
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if err != nil {
 			return err
 		}
