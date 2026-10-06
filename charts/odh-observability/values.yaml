@@ -8,6 +8,7 @@ operatorNamespace: opendatahub-operator-system
 # Defaults to operatorNamespace when empty. On RHOAI this is
 # spec.monitoring.namespace (e.g. redhat-ods-monitoring).
 monitoringNamespace: ""
+metricsNamespace: ""
 
 image:
   repository: quay.io/opendatahub/odh-observability
