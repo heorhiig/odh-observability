@@ -23,7 +23,10 @@ The operator watches a singleton `Monitoring` CR (`services.platform.opendatahub
 
 - Go 1.26+
 - An OpenShift cluster with `KUBECONFIG` configured
-- One or more of: Cluster Observability Operator, Tempo Operator, OpenTelemetry Operator, cert-manager
+- OpenTelemetry Operator for metrics; Cluster Observability Operator for built-in metrics storage
+- OpenTelemetry Operator for traces; Tempo Operator for built-in trace storage
+- OpenTelemetry Operator and Loki Operator for usage logs
+- cert-manager for the mutating webhook
 
 ### Build
 

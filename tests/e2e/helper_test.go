@@ -29,7 +29,8 @@ const (
 	MonitoringStackName               = "data-science-monitoringstack"
 	OpenTelemetryCollectorName        = "data-science-collector"
 	TargetAllocatorDeploymentName     = "data-science-collector-targetallocator"
-	TargetAllocatorServiceAccount     = "data-science-collector-collector"
+	CollectorServiceAccount           = "data-science-collector-collector"
+	TargetAllocatorServiceAccount     = "data-science-collector-targetallocator"
 	TempoMonolithicName               = "data-science-tempomonolithic"
 	TempoStackName                    = "data-science-tempostack"
 	InstrumentationName               = "data-science-instrumentation"
@@ -57,6 +58,20 @@ const (
 	opentelemetryOpName      = "opentelemetry-product"
 	opentelemetryOpNamespace = "openshift-opentelemetry-operator"
 	opentelemetryOpChannel   = "stable"
+
+	certManagerOpName      = "openshift-cert-manager-operator"
+	certManagerOpNamespace = "cert-manager-operator"
+	certManagerOpChannel   = "stable-v1"
+
+	leaderWorkerSetOpName      = "leader-worker-set"
+	leaderWorkerSetOpNamespace = "openshift-lws-operator"
+	leaderWorkerSetOpChannel   = "stable-v1.0"
+
+	connectivityLinkOpName      = "rhcl-operator"
+	connectivityLinkOpNamespace = "openshift-operators"
+	connectivityLinkOpChannel   = "stable"
+	connectivityLinkOpSource    = "redhat-operators"
+	kuadrantResourceNamespace   = "kuadrant-system"
 
 	lokiOpName      = "loki-operator"
 	lokiOpNamespace = "openshift-operators-redhat"
@@ -766,6 +781,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	if testOpts.installOperators {
 		tc.installDependentOperators(t)
 	}
+	tc.ensureCRDExists(t, gvk.CertManagerCertificate)
 	for _, name := range []string{
 		"cluster-observability-operator",
 		"tempo-operator",
@@ -809,8 +825,9 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	tc.resetMonitoringConfigToManaged()
 }
 
-// installDependentOperators installs required OLM operators. Each operator gets
-// its own namespace, OperatorGroup, and Subscription when it is not already present.
+// installDependentOperators installs required OLM operators in parallel sub-tests.
+// Each operator gets its own namespace, OperatorGroup, and Subscription when it is
+// not already present.
 func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 	t.Helper()
 
@@ -824,6 +841,7 @@ func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 		{observabilityOpNamespace, observabilityOpName, observabilityOpChannel},
 		{tempoOpNamespace, tempoOpName, tempoOpChannel},
 		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
+		{certManagerOpNamespace, certManagerOpName, certManagerOpChannel},
 	}
 
 	t.Run("install-dependent-operators", func(t *testing.T) {
