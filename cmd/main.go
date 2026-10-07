@@ -68,7 +68,7 @@ func main() {
 		enableWebhook  bool
 	)
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "Directory containing the webhook TLS certificate.")
@@ -88,6 +88,8 @@ func main() {
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
+			SecureServing: true,
+			CertDir:       webhookCertDir,
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,

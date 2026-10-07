@@ -12,18 +12,22 @@ spec:
   policyTypes:
   - Ingress
   ingress:
+  # Metrics (8443/HTTPS) — ingress only from supported monitoring namespaces
   - ports:
     - protocol: TCP
-      port: 8080
+      port: 8443
     from:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: {{ .Values.monitoringNamespace }}
-
+  # Health-probe (8081) — ingress from all sources
+  # Rationale: kubelet/node-originated probes are not reliably constrainable via
+  # NetworkPolicy peer selectors since they originate from the node's host network.
+  # Restricting this port would break liveness/readiness checks during operator restarts.
   - ports:
     - protocol: TCP
       port: 8081
-
+  # Webhook (9443) — ingress from API-server CIDR
   - ports:
     - protocol: TCP
       port: 9443

@@ -7,8 +7,8 @@ operatorNamespace: opendatahub-operator-system
 # Tempo write ACL treats this namespace name as the RBAC resource.
 # Defaults to operatorNamespace when empty. On RHOAI this is
 # spec.monitoring.namespace (e.g. redhat-ods-monitoring).
+# Also used as the allowed source for operator metrics NetworkPolicy ingress.
 monitoringNamespace: ""
-metricsNamespace: ""
 
 image:
   repository: quay.io/opendatahub/odh-observability
