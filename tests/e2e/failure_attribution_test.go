@@ -19,7 +19,9 @@ func TestFormatFailureAttribution(t *testing.T) {
 					"oc -n ns describe deployment thanos-querier",
 				},
 			},
-			want: "FAILURE ATTRIBUTION | Component=Thanos | Rollout=resourceVersion=123 generation=4 | Assertion=Deployment thanos-querier ready replicas | Diagnostics: oc -n ns logs deployment/thanos-querier ; oc -n ns describe deployment thanos-querier",
+			want: "FAILURE ATTRIBUTION | Component=Thanos | Rollout=resourceVersion=123 generation=4 | " +
+				"Assertion=Deployment thanos-querier ready replicas | " +
+				"Diagnostics: oc -n ns logs deployment/thanos-querier ; oc -n ns describe deployment thanos-querier",
 		},
 		{
 			name: "single diagnostic",
