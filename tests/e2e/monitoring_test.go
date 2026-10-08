@@ -962,10 +962,12 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 		t.Run("Test Prometheus NetworkPolicy allows Thanos Querier on gRPC port", tc.ValidatePrometheusNetworkPolicyAllowsThanosQuerier)
 
 		t.Run("Component Isolation — Thanos", func(t *testing.T) {
-			t.Run("Test Thanos baseline fixture — record component versions and health", tc.ValidateThanosComponentBaselineFixture)
-			t.Run("Test Thanos version boundary change — query readiness, PromQL, conditions", tc.ValidateThanosComponentBoundaryChange)
-			t.Run("Test Thanos failure attribution — component, versions, assertion, diagnostics", tc.ValidateThanosComponentFailureAttribution)
+			t.Run("Test Thanos baseline fixture — record rollout identity and health", tc.ValidateThanosComponentBaselineFixture)
+			t.Run("Test Thanos version boundary — UNSUPPORTED (no operand pinning), reported as SKIP", tc.ValidateThanosComponentVersionBoundaryUnsupported)
+			t.Run("Test Thanos component health check with failure-attribution diagnostics", tc.ValidateThanosComponentHealthWithDiagnostics)
 		})
+
+		t.Run("Integration — Thanos ⇄ Perses datasource wiring", tc.ValidateThanosPersesDatasourceIntegration)
 	})
 }
 
@@ -1126,11 +1128,8 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 	g.Expect(host).NotTo(BeEmpty(), "Component=Thanos Assertion=promql-response: Route %s has no host", ThanosQuerierRouteName)
 
 	token := getAuthToken(tc.TestContext)
-	if token == "" {
-		msg := fmt.Sprintf("query=%q SKIPPED (no bearer token: set OC_TOKEN or use token-auth kubeconfig)", query)
-		t.Logf("Component=Thanos Assertion=promql-response: %s", msg)
-		return msg
-	}
+	g.Expect(token).NotTo(BeEmpty(),
+		"Component=Thanos Assertion=promql-response: no bearer token available for query %q (set OC_TOKEN or use a token-auth kubeconfig)", query)
 
 	endpoint := fmt.Sprintf("https://%s/api/v1/query?query=%s", host, url.QueryEscape(query))
 	httpClient := &http.Client{
@@ -1157,7 +1156,11 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("PromQL query %q returned HTTP %d: %s", query, resp.StatusCode, strings.TrimSpace(string(body)))
+			httpErr := fmt.Errorf("PromQL query %q returned HTTP %d (want 200)", query, resp.StatusCode)
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				return httpErr
+			}
+			return StopTrying(httpErr.Error())
 		}
 
 		var parsed struct {
@@ -1172,6 +1175,9 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 		}
 		if parsed.Status != "success" {
 			return fmt.Errorf("PromQL query %q returned status=%q (want success)", query, parsed.Status)
+		}
+		if parsed.Data.ResultType != "vector" {
+			return fmt.Errorf("PromQL query %q returned resultType=%q (want vector)", query, parsed.Data.ResultType)
 		}
 		if len(parsed.Data.Result) == 0 {
 			return fmt.Errorf("PromQL query %q returned 0 series", query)
@@ -1199,7 +1205,7 @@ func (tc *MonitoringTestCtx) ValidateThanosComponentBaselineFixture(t *testing.T
 		WithCustomErrorMsg("Component=Thanos: ThanosQuerierAvailable condition did not become True — Thanos failed independently of Perses/Prometheus"),
 	)
 
-	thanosVersion := tc.recordComponentVersion(t, gvk.ThanosQuerier, ThanosQuerierName)
+	thanosRollout := tc.recordRolloutIdentity(t, gvk.ThanosQuerier, ThanosQuerierName)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: thanosQuerierDeploymentName, Namespace: tc.MonitoringNamespace}),
@@ -1221,66 +1227,70 @@ func (tc *MonitoringTestCtx) ValidateThanosComponentBaselineFixture(t *testing.T
 
 	promqlResult := tc.assertThanosPromQLResponds(t, "up")
 
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
-		WithCondition(jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("%s")`, thanosQuerierDeploymentName)),
-		WithCustomErrorMsg("Component=Thanos Assertion=dependent-dashboards: PersesDatasource %s no longer points at Thanos Querier", PersesDatasourceName),
-	)
-
 	t.Logf(
 		"✓ THANOS BASELINE RECORDED (independent of Perses)\n"+
 			"  • Component:          Thanos Querier\n"+
-			"  • Pinned version:     %s\n"+
+			"  • Rollout identity:   %s\n"+
 			"  • CR status:          ThanosQuerierAvailable=True\n"+
 			"  • Query readiness:    Deployment %s ready replicas up\n"+
 			"  • PromQL endpoint:    Route %s → %s (edge TLS)\n"+
-			"  • PromQL response:    %s\n"+
-			"  • Dependent dashboards: PersesDatasource %s → Thanos Querier\n",
-		thanosVersion, thanosQuerierDeploymentName, ThanosQuerierRouteName, thanosQuerierDeploymentName, promqlResult, PersesDatasourceName)
+			"  • PromQL response:    %s\n",
+		thanosRollout, thanosQuerierDeploymentName, ThanosQuerierRouteName, thanosQuerierDeploymentName, promqlResult)
 }
 
-func (tc *MonitoringTestCtx) ValidateThanosComponentBoundaryChange(t *testing.T) {
+func (tc *MonitoringTestCtx) ValidateThanosPersesDatasourceIntegration(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
 
 	tc.ensureMetricsManaged()
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
-		WithCondition(jq.Match(
-			`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-			conditions.ConditionThanosQuerierAvailable, metav1.ConditionTrue,
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("%s")`, thanosQuerierDeploymentName),
 		)),
-		WithCustomErrorMsg("Component=Thanos: not healthy before boundary-change check"),
+		WithCustomErrorMsg("Integration=Thanos⇄Perses Assertion=dependent-dashboards: PersesDatasource %s does not route through HTTPProxy to Thanos Querier", PersesDatasourceName),
 	)
 
-	thanosVersion := tc.recordComponentVersion(t, gvk.ThanosQuerier, ThanosQuerierName)
+	t.Logf(
+		"✓ THANOS ⇄ PERSES DATASOURCE WIRING OK\n"+
+			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → Thanos Querier (%s)\n",
+		PersesDatasourceName, thanosQuerierDeploymentName)
+}
+
+func (tc *MonitoringTestCtx) ValidateThanosComponentVersionBoundaryUnsupported(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	rollout := tc.recordRolloutIdentity(t, gvk.ThanosQuerier, ThanosQuerierName)
 
 	t.Skipf(
-		"LIMITATION (Component=Thanos): independent version-boundary testing is not possible. "+
-			"COO packages Perses, Thanos and MonitoringStack under a single operator version, so the "+
-			"Thanos operand version cannot be pinned/swapped independently. Current healthy version: %s. "+
-			"Reporting this as SKIP (not PASS) to avoid a false-green result.",
-		thanosVersion,
+		"LIMITATION (Component=Thanos): independent version-boundary testing is UNSUPPORTED and no "+
+			"version boundary is exercised here. COO packages Perses, Thanos and MonitoringStack under a "+
+			"single operator version, so the Thanos operand version cannot be pinned or swapped "+
+			"independently. Current rollout identity: %s. Reported as SKIP (not PASS) so this is not "+
+			"mistaken for boundary coverage; revisit once operand pinning is available.",
+		rollout,
 	)
 }
 
-func (tc *MonitoringTestCtx) ValidateThanosComponentFailureAttribution(t *testing.T) {
+func (tc *MonitoringTestCtx) ValidateThanosComponentHealthWithDiagnostics(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
 
 	tc.ensureMetricsManaged()
 
-	thanosVersion := tc.recordComponentVersion(t, gvk.ThanosQuerier, ThanosQuerierName)
-
-	attribution := fmt.Sprintf(
-		"FAILURE ATTRIBUTION | Component=Thanos | Version=%s | Assertion=Deployment %s ready replicas | "+
-			"Diagnostics: oc -n %s logs deployment/%s ; oc -n %s describe deployment %s ; oc -n %s get thanosquerier %s -o yaml",
-		thanosVersion, thanosQuerierDeploymentName,
-		tc.MonitoringNamespace, thanosQuerierDeploymentName,
-		tc.MonitoringNamespace, thanosQuerierDeploymentName,
-		tc.MonitoringNamespace, ThanosQuerierName,
-	)
+	attribution := formatFailureAttribution(failureAttribution{
+		component: "Thanos",
+		rollout:   tc.recordRolloutIdentity(t, gvk.ThanosQuerier, ThanosQuerierName),
+		assertion: fmt.Sprintf("Deployment %s ready replicas", thanosQuerierDeploymentName),
+		diagnostics: []string{
+			fmt.Sprintf("oc -n %s logs deployment/%s", tc.MonitoringNamespace, thanosQuerierDeploymentName),
+			fmt.Sprintf("oc -n %s describe deployment %s", tc.MonitoringNamespace, thanosQuerierDeploymentName),
+			fmt.Sprintf("oc -n %s get thanosquerier %s -o yaml", tc.MonitoringNamespace, ThanosQuerierName),
+		},
+	})
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: thanosQuerierDeploymentName, Namespace: tc.MonitoringNamespace}),
@@ -1291,7 +1301,7 @@ func (tc *MonitoringTestCtx) ValidateThanosComponentFailureAttribution(t *testin
 		WithCustomErrorMsg(attribution),
 	)
 
-	t.Logf("✓ Thanos failure-attribution report is wired and health check passed:\n%s", attribution)
+	t.Logf("✓ Thanos health check passed; failure-attribution diagnostics wired:\n%s", attribution)
 }
 
 // ========================================================================
@@ -1753,9 +1763,9 @@ func (tc *MonitoringTestCtx) runPersesTests(t *testing.T) {
 		})
 
 		t.Run("Component Isolation — Perses", func(t *testing.T) {
-			t.Run("Test Perses baseline fixture — record component versions and health", tc.ValidatePersesComponentBaselineFixture)
-			t.Run("Test Perses version boundary change — dashboard config, readiness, routing", tc.ValidatePersesComponentBoundaryChange)
-			t.Run("Test Perses failure attribution — component, versions, assertion, diagnostics", tc.ValidatePersesComponentFailureAttribution)
+			t.Run("Test Perses baseline fixture — record rollout identity and health", tc.ValidatePersesComponentBaselineFixture)
+			t.Run("Test Perses version boundary — UNSUPPORTED (no operand pinning), reported as SKIP", tc.ValidatePersesComponentVersionBoundaryUnsupported)
+			t.Run("Test Perses component health check with failure-attribution diagnostics", tc.ValidatePersesComponentHealthWithDiagnostics)
 		})
 	})
 }
@@ -1765,16 +1775,28 @@ const (
 	persesPodName               = PersesName + "-0"
 )
 
-func (tc *MonitoringTestCtx) recordComponentVersion(t *testing.T, componentGVK schema.GroupVersionKind, name string) string {
+type failureAttribution struct {
+	component   string
+	rollout     string
+	assertion   string
+	diagnostics []string
+}
+
+func formatFailureAttribution(a failureAttribution) string {
+	return fmt.Sprintf(
+		"FAILURE ATTRIBUTION | Component=%s | Rollout=%s | Assertion=%s | Diagnostics: %s",
+		a.component, a.rollout, a.assertion, strings.Join(a.diagnostics, " ; "),
+	)
+}
+
+func (tc *MonitoringTestCtx) recordRolloutIdentity(t *testing.T, componentGVK schema.GroupVersionKind, name string) string {
 	t.Helper()
 
-	r := tc.FetchResource(
-		WithMinimalObject(componentGVK, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
-	)
-	if r == nil {
+	u, err := tc.fetchResource(t, componentGVK, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace})
+	if err != nil || u == nil {
 		return "<absent>"
 	}
-	return fmt.Sprintf("resourceVersion=%s generation=%d", r.GetResourceVersion(), r.GetGeneration())
+	return fmt.Sprintf("resourceVersion=%s generation=%d", u.GetResourceVersion(), u.GetGeneration())
 }
 
 func (tc *MonitoringTestCtx) ensureMetricsManaged() {
@@ -1799,7 +1821,7 @@ func (tc *MonitoringTestCtx) ValidatePersesComponentBaselineFixture(t *testing.T
 		WithCustomErrorMsg("Component=Perses: PersesAvailable condition did not become True — Perses failed independently of Thanos/Prometheus"),
 	)
 
-	persesVersion := tc.recordComponentVersion(t, gvk.Perses, PersesName)
+	persesRollout := tc.recordRolloutIdentity(t, gvk.Perses, PersesName)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Perses, types.NamespacedName{Name: PersesName, Namespace: tc.MonitoringNamespace}),
@@ -1818,15 +1840,6 @@ func (tc *MonitoringTestCtx) ValidatePersesComponentBaselineFixture(t *testing.T
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
-		WithCondition(And(
-			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier-data-science-thanos-querier")`),
-		)),
-		WithCustomErrorMsg("Component=Perses Assertion=proxy-routing: PersesDatasource %s does not route through HTTPProxy to Thanos Querier", PersesDatasourceName),
-	)
-
-	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: persesPodName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.status.phase == "Running"`),
@@ -1838,57 +1851,46 @@ func (tc *MonitoringTestCtx) ValidatePersesComponentBaselineFixture(t *testing.T
 	t.Logf(
 		"✓ PERSES BASELINE RECORDED (independent of Thanos)\n"+
 			"  • Component:        Perses\n"+
-			"  • Pinned version:   %s\n"+
+			"  • Rollout identity: %s\n"+
 			"  • CR status:        PersesAvailable=True\n"+
 			"  • Dashboard config: .spec.config database+schemas present\n"+
 			"  • Service ready:    StatefulSet %s readyReplicas=1\n"+
-			"  • Proxy routing:    PersesDatasource %s → Thanos Querier\n"+
 			"  • API:              Pod %s Running/Ready on :8080\n",
-		persesVersion, PersesName, PersesDatasourceName, persesPodName)
+		persesRollout, PersesName, persesPodName)
 }
 
-func (tc *MonitoringTestCtx) ValidatePersesComponentBoundaryChange(t *testing.T) {
+func (tc *MonitoringTestCtx) ValidatePersesComponentVersionBoundaryUnsupported(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
 
-	tc.ensureMetricsManaged()
-
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
-		WithCondition(jq.Match(
-			`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-			conditions.ConditionPersesAvailable, metav1.ConditionTrue,
-		)),
-		WithCustomErrorMsg("Component=Perses: not healthy before boundary-change check"),
-	)
-
-	persesVersion := tc.recordComponentVersion(t, gvk.Perses, PersesName)
+	rollout := tc.recordRolloutIdentity(t, gvk.Perses, PersesName)
 
 	t.Skipf(
-		"LIMITATION (Component=Perses): independent version-boundary testing is not possible. "+
-			"COO packages Perses, Thanos and MonitoringStack under a single operator version, so the "+
-			"Perses operand version cannot be pinned/swapped independently. Current healthy version: %s. "+
-			"Reporting this as SKIP (not PASS) to avoid a false-green result.",
-		persesVersion,
+		"LIMITATION (Component=Perses): independent version-boundary testing is UNSUPPORTED and no "+
+			"version boundary is exercised here. COO packages Perses, Thanos and MonitoringStack under a "+
+			"single operator version, so the Perses operand version cannot be pinned or swapped "+
+			"independently. Current rollout identity: %s. Reported as SKIP (not PASS) so this is not "+
+			"mistaken for boundary coverage; revisit once operand pinning is available.",
+		rollout,
 	)
 }
 
-func (tc *MonitoringTestCtx) ValidatePersesComponentFailureAttribution(t *testing.T) {
+func (tc *MonitoringTestCtx) ValidatePersesComponentHealthWithDiagnostics(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
 
 	tc.ensureMetricsManaged()
 
-	persesVersion := tc.recordComponentVersion(t, gvk.Perses, PersesName)
-
-	attribution := fmt.Sprintf(
-		"FAILURE ATTRIBUTION | Component=Perses | Version=%s | Assertion=Pod %s Running/Ready | "+
-			"Diagnostics: oc -n %s logs %s ; oc -n %s describe pod %s ; oc -n %s get perses %s -o yaml",
-		persesVersion, persesPodName,
-		tc.MonitoringNamespace, persesPodName,
-		tc.MonitoringNamespace, persesPodName,
-		tc.MonitoringNamespace, PersesName,
-	)
+	attribution := formatFailureAttribution(failureAttribution{
+		component: "Perses",
+		rollout:   tc.recordRolloutIdentity(t, gvk.Perses, PersesName),
+		assertion: fmt.Sprintf("Pod %s Running/Ready", persesPodName),
+		diagnostics: []string{
+			fmt.Sprintf("oc -n %s logs %s", tc.MonitoringNamespace, persesPodName),
+			fmt.Sprintf("oc -n %s describe pod %s", tc.MonitoringNamespace, persesPodName),
+			fmt.Sprintf("oc -n %s get perses %s -o yaml", tc.MonitoringNamespace, PersesName),
+		},
+	})
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: persesPodName, Namespace: tc.MonitoringNamespace}),
@@ -1899,7 +1901,7 @@ func (tc *MonitoringTestCtx) ValidatePersesComponentFailureAttribution(t *testin
 		WithCustomErrorMsg(attribution),
 	)
 
-	t.Logf("✓ Perses failure-attribution report is wired and health check passed:\n%s", attribution)
+	t.Logf("✓ Perses health check passed; failure-attribution diagnostics wired:\n%s", attribution)
 }
 
 // ValidatePersesCRCreation tests that Perses CR is created when monitoring is managed with metrics.
