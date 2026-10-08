@@ -1244,19 +1244,22 @@ func (tc *MonitoringTestCtx) ValidateThanosPersesDatasourceIntegration(t *testin
 
 	tc.ensureMetricsManaged()
 
+	expectedThanosURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:10902", thanosQuerierDeploymentName, tc.MonitoringNamespace)
+
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("%s")`, thanosQuerierDeploymentName),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "%s"`, expectedThanosURL),
 		)),
-		WithCustomErrorMsg("Integration=Thanos⇄Perses Assertion=dependent-dashboards: PersesDatasource %s does not route through HTTPProxy to Thanos Querier", PersesDatasourceName),
+		WithCustomErrorMsg("Integration=Thanos⇄Perses Assertion=dependent-dashboards: "+
+			"PersesDatasource %s does not route through HTTPProxy to Thanos Querier at %s", PersesDatasourceName, expectedThanosURL),
 	)
 
 	t.Logf(
 		"✓ THANOS ⇄ PERSES DATASOURCE WIRING OK\n"+
-			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → Thanos Querier (%s)\n",
-		PersesDatasourceName, thanosQuerierDeploymentName)
+			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → %s\n",
+		PersesDatasourceName, expectedThanosURL)
 }
 
 func (tc *MonitoringTestCtx) ValidateThanosComponentVersionBoundaryUnsupported(t *testing.T) {
