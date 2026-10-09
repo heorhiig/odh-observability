@@ -1120,12 +1120,28 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 	t.Helper()
 	g := NewWithT(t)
 
-	route := tc.FetchResource(
-		WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
-	)
-	g.Expect(route).NotTo(BeNil(), "Component=Thanos Assertion=promql-response: Route %s not found", ThanosQuerierRouteName)
-	host, _, _ := unstructured.NestedString(route.Object, "spec", "host")
-	g.Expect(host).NotTo(BeEmpty(), "Component=Thanos Assertion=promql-response: Route %s has no host", ThanosQuerierRouteName)
+	var host string
+	g.Eventually(func() (string, error) {
+		route := tc.FetchResource(
+			WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
+		)
+		if route == nil {
+			return "", fmt.Errorf("Route %s not found", ThanosQuerierRouteName)
+		}
+		var ingressHost string
+		if ingress, found, _ := unstructured.NestedSlice(route.Object, "status", "ingress"); found && len(ingress) > 0 {
+			if entry, ok := ingress[0].(map[string]interface{}); ok {
+				ingressHost, _, _ = unstructured.NestedString(entry, "host")
+			}
+		}
+		if ingressHost == "" {
+			// Fall back to spec.host for clusters where the admission plugin writes it back.
+			ingressHost, _, _ = unstructured.NestedString(route.Object, "spec", "host")
+		}
+		host = ingressHost
+		return host, nil
+	}).ShouldNot(BeEmpty(),
+		"Component=Thanos Assertion=promql-response: Route %s has no ingress host", ThanosQuerierRouteName)
 
 	token := getAuthToken(tc.TestContext)
 	g.Expect(token).NotTo(BeEmpty(),
