@@ -1130,7 +1130,7 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 		}
 		var ingressHost string
 		if ingress, found, _ := unstructured.NestedSlice(route.Object, "status", "ingress"); found && len(ingress) > 0 {
-			if entry, ok := ingress[0].(map[string]interface{}); ok {
+			if entry, ok := ingress[0].(map[string]any); ok {
 				ingressHost, _, _ = unstructured.NestedString(entry, "host")
 			}
 		}
