@@ -87,9 +87,11 @@ func main() {
 	mgrOpts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
+			BindAddress:   metricsAddr,
 			SecureServing: true,
-			CertDir:       webhookCertDir,
+			CertDir:       "/etc/metrics-tls",
+			CertName:      "tls.crt",
+			KeyName:       "tls.key",
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,

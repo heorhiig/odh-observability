@@ -1,0 +1,23 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-metrics
+  namespace: {{ .Values.monitoringNamespace | default .Values.operatorNamespace }}
+  labels:
+    {{- include "odh-observability.labels" . | nindent 4 }}
+spec: 
+  endpoints:
+    - path: /metrics
+      port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true
+  selector:
+    matchLabels:
+      {{- include "odh-observability.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.operatorNamespace }}
+{{- end }}
