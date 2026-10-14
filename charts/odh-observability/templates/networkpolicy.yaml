@@ -37,8 +37,12 @@ spec:
   - ports:
     - protocol: TCP
       port: 9443
+    {{- if .Values.webhookIngressCIDRs }}
     from:
     {{- range .Values.webhookIngressCIDRs }}
     - ipBlock:
         cidr: {{ . }}
+    {{- end }}
+    {{- else }}
+    {{- fail "webhookIngressCIDRs must not be empty. Set explicit CIDRs for API server access or use the default OpenShift values." }}
     {{- end }}
