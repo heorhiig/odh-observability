@@ -13,8 +13,9 @@ spec:
   - Ingress
   ingress:
   # Metrics (8443/HTTPS) — ingress only from supported monitoring namespaces
-  # Note: Endpoint does not enforce in-process authentication/authorization (no FilterProvider).
-  # Unauthorized access denial relies solely on this NetworkPolicy rule.
+  # The metrics server enforces authentication and authorization via FilterProvider
+  # (WithAuthenticationAndAuthorization), requiring a valid bearer token and SubjectAccessReview.
+  # This NetworkPolicy provides defense-in-depth at the network layer.
   - ports:
     - protocol: TCP
       port: 8443
@@ -29,9 +30,15 @@ spec:
   - ports:
     - protocol: TCP
       port: 8081
-  # Webhook (9443) — ingress from all sources
-  # Rationale: kube-apiserver source address cannot be reliably predicted via NetworkPolicy
-  # selectors (varies by cluster topology, hosted control plane, etc). Port-scoped rule only.
+  # Webhook (9443) — ingress from API server CIDRs
+  # Rationale: kube-apiserver source varies by topology (service network for standard,
+  # pod network for self-hosted, external for managed services). CIDRs are configurable
+  # via .Values.webhookIngressCIDRs to accommodate cluster-specific requirements.
   - ports:
     - protocol: TCP
       port: 9443
+    from:
+    {{- range .Values.webhookIngressCIDRs }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
