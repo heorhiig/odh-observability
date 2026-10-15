@@ -51,8 +51,7 @@ webhookIngressCIDRs:
 metrics:
   # Enable ServiceMonitor resource creation for Prometheus Operator.
   serviceMonitor:
-    enabled: true
-    # API version for ServiceMonitor:
-    # - monitoring.rhobs/v1: RHOBS Cluster Observability Operator (production RHOAI)
-    # - monitoring.coreos.com/v1: Upstream Prometheus Operator
+    # Enable after the RHOBS ServiceMonitor CRD is available.
+    # Supported deployments must enable this explicitly to scrape metrics.
+    enabled: false
     apiVersion: monitoring.rhobs/v1
