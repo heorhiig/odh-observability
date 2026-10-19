@@ -102,6 +102,20 @@ func findCondition(m *v1alpha1.Monitoring, condType string) *platformcommon.Cond
 	return libconditions.FindStatusCondition(m, condType)
 }
 
+// mustFindCondition returns the named status condition, failing the test when
+// it is absent. The explicit nil guard keeps staticcheck's SA5011 happy: it
+// cannot see that t.Fatal terminates the test, so a bare nil check followed
+// by field access looks like a possible nil pointer dereference.
+func mustFindCondition(t *testing.T, m *v1alpha1.Monitoring, condType string) *platformcommon.Condition {
+	t.Helper()
+
+	c := findCondition(m, condType)
+	if c == nil {
+		t.Fatalf("expected %s condition to be set", condType)
+	}
+	return c
+}
+
 // --- deployMonitoringStackWithQuerierAndRestrictions ---
 
 func TestDeployMonitoringStack_NoMetrics(t *testing.T) {
@@ -889,8 +903,8 @@ func TestDeployClusterLogForwarder_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (CLF + RBAC), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy), got %d", len(sources))
 	}
 }
 
@@ -919,6 +933,7 @@ func TestDeployClusterLogForwarder_CRDMissing(t *testing.T) {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
 		return
 	}
+	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -954,8 +969,8 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 0 {
-		t.Errorf("expected no sources when LokiStack is not ready, got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy) when LokiStack is not ready, got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
@@ -963,6 +978,7 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
 		return
 	}
+	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -1013,8 +1029,8 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (CLF + RBAC) even when CLF is not ready, got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy) even when CLF is not ready, got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
@@ -1022,6 +1038,7 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
 		return
 	}
+	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -1078,13 +1095,16 @@ func TestDeployClusterLogForwarder_UsesClusterLoggingNamespace(t *testing.T) {
 		t.Fatalf("rendering ClusterLogForwarder templates: %v", err)
 	}
 	for i := range objects {
-		if objects[i].GetKind() != "ClusterLogForwarder" && objects[i].GetKind() != "ServiceAccount" {
+		if objects[i].GetKind() != "ClusterLogForwarder" && objects[i].GetKind() != "ServiceAccount" && objects[i].GetKind() != "NetworkPolicy" {
 			continue
 		}
 		if objects[i].GetNamespace() != "openshift-logging" {
 			t.Fatalf("%s %q: want namespace openshift-logging, got %q", objects[i].GetKind(), objects[i].GetName(), objects[i].GetNamespace())
 		}
 		if objects[i].GetKind() != "ClusterLogForwarder" {
+			if objects[i].GetKind() == "NetworkPolicy" && objects[i].GetName() != ClusterLogForwarderNetworkPolicyName {
+				t.Fatalf("unexpected ClusterLogForwarder NetworkPolicy name %q", objects[i].GetName())
+			}
 			continue
 		}
 		outputs, found, err := unstructured.NestedSlice(objects[i].Object, "spec", "outputs")
@@ -1136,8 +1156,8 @@ func TestDeployClusterLogForwarder_ExplicitInferenceNamespaces(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources, got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources, got %d", len(sources))
 	}
 
 	data, err := buildTemplateData(context.Background(), cli, m, "")
@@ -1377,6 +1397,7 @@ func TestDeployUsageLogsCollector_LokiStackNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil {
 		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1416,6 +1437,7 @@ func TestDeployUsageLogsCollector_CRDMissing(t *testing.T) {
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil {
 		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1716,6 +1738,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
 			if condition == nil {
 				t.Fatal("expected Korrel8rAvailable condition")
+				return
 			}
 			if condition.Status != tt.wantStatus {
 				t.Errorf("status: want %s, got %s", tt.wantStatus, condition.Status)
@@ -1770,6 +1793,7 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
 	if condition == nil {
 		t.Fatal("expected Korrel8rAvailable condition")
+		return
 	}
 	if condition.Status != metav1.ConditionTrue {
 		t.Fatalf("status: want True, got %s", condition.Status)
@@ -1892,6 +1916,7 @@ func assertKorrel8rTLSEndpoint(t *testing.T, deployment, service, networkPolicy 
 	t.Helper()
 	if deployment == nil || service == nil || networkPolicy == nil {
 		t.Fatal("rendered Korrel8r resources are incomplete")
+		return
 	}
 	containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
 	if err != nil || !found || len(containers) != 1 {

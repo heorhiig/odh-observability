@@ -52,6 +52,7 @@ import (
 
 const (
 	opentelemetryOperator        = "opentelemetry-operator"
+	certManagerOperator          = "cert-manager-operator"
 	clusterObservabilityOperator = "cluster-observability-operator"
 	tempoOperator                = "tempo-operator"
 	lokiOperator                 = "loki-operator"
@@ -193,7 +194,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	// LokiStack configuration
-	lokiStackName := "data-science-lokistack"
+	lokiStackName := lokiStackResourceName
 	templateData["LokiStackName"] = lokiStackName
 	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
 	// application tenant is the pinned tenant for inference logs.
@@ -237,9 +238,10 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	// Cluster log forwarding configuration
-	clusterLogForwarderName := "data-science-cluster-log-forwarder"
+	clusterLogForwarderName := clusterLogForwarderResourceName
 	templateData["ClusterLogForwarderName"] = clusterLogForwarderName
 	templateData["ClusterLogForwarderServiceAccount"] = clusterLogForwarderName + "-collector"
+	templateData["ClusterLogForwarderNetworkPolicyName"] = ClusterLogForwarderNetworkPolicyName
 	templateData["ClusterLoggingNamespace"] = clusterLoggingNamespace
 
 	if logs := monitoring.Spec.Logs; logs != nil {
@@ -313,6 +315,7 @@ func addKorrel8rConfigChecksum(templateData map[string]any) error {
 
 func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {
 	templateData["Korrel8rAPIServerCIDRs"] = []string{}
+	templateData["KubernetesAPIServerCIDRs"] = []string{}
 	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil && monitoring.Spec.Logs == nil {
 		return nil
 	}
@@ -330,6 +333,7 @@ func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *
 		return fmt.Errorf("resolving Kubernetes API endpoint CIDRs for Korrel8r: %w", err)
 	}
 	templateData["Korrel8rAPIServerCIDRs"] = apiServerCIDRs
+	templateData["KubernetesAPIServerCIDRs"] = apiServerCIDRs
 	return nil
 }
 
@@ -398,6 +402,18 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 
 	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsConfigured {
 		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
+			return err
+		}
+	}
+
+	// Metrics TargetAllocator mTLS is always cert-manager-backed. Check the
+	// operator explicitly so a missing dependency is reported before the
+	// OpenTelemetry admission webhook rejects the collector resource.
+	if monitoring.Spec.Metrics != nil {
+		if err := checkOperatorNames(
+			[]string{certManagerOperator, "openshift-cert-manager-operator"},
+			conditions.CertManagerOperatorMissingMessage,
+		); err != nil {
 			return err
 		}
 	}

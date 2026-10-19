@@ -298,6 +298,7 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 	}
 	if dependenciesReady == nil {
 		t.Fatal("MonitoringDependenciesReady condition was not reported")
+		return
 	}
 	if dependenciesReady.Status != metav1.ConditionFalse {
 		t.Errorf("MonitoringDependenciesReady: want False, got %q", dependenciesReady.Status)
@@ -363,6 +364,7 @@ func TestReconcile_LoggingPreconditionsFailed(t *testing.T) {
 	}
 	if dependenciesReady == nil {
 		t.Fatal("MonitoringDependenciesReady condition was not reported")
+		return
 	}
 	if dependenciesReady.Status != metav1.ConditionFalse || dependenciesReady.Reason != "MissingOperator" {
 		t.Errorf("MonitoringDependenciesReady: want False/MissingOperator, got %s/%s",
@@ -787,6 +789,17 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 		{
 			name:         "monitoring namespace resource uses main collector",
 			obj:          staleMonitoringConfigMap,
+			wantMainGC:   true,
+			wantTargetGC: false,
+		},
+		{
+			name: "cluster logging namespace resource uses main collector",
+			obj: ownedGarbageCollectionTestObject(
+				schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
+				clusterLoggingNamespace,
+				ClusterLogForwarderNetworkPolicyName,
+				monitoring.UID,
+			),
 			wantMainGC:   true,
 			wantTargetGC: false,
 		},
