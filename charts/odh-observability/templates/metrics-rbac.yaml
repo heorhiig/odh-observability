@@ -9,9 +9,9 @@ rules:
   # The controller-runtime metrics server enforces this via SubjectAccessReview
   # when FilterProvider: WithAuthenticationAndAuthorization is enabled.
   - nonResourceURLs:
-      - /metrics
+      - "/metrics"
     verbs:
-      - get
+      - "get"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
