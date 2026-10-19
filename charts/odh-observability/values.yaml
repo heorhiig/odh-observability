@@ -57,3 +57,12 @@ affinity: {}
 env: []
 # - name: RELATED_IMAGE_PERSES_IMAGE
 #   value: "registry.redhat.io/cluster-observability-operator/perses-rhel9:1.5.0-1781116652"
+
+# Metrics configuration
+metrics:
+  serviceMonitor:
+    # Enable operator metrics ServiceMonitor creation.
+    # Requires Cluster Observability Operator (COO) or Prometheus Operator.
+    enabled: true
+    # API version for ServiceMonitor (monitoring.rhobs/v1 for COO, monitoring.coreos.com/v1 for upstream)
+    apiVersion: monitoring.rhobs/v1
