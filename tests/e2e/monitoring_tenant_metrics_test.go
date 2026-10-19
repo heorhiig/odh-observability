@@ -1083,7 +1083,7 @@ func (tc *MonitoringTestCtx) ensureTenantMetricsEnvironment(t *testing.T) {
 
 	t.Cleanup(func() {
 		tc.DeleteResource(
-			WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{Name: tenantMetricsWorkloadName, Namespace: tenantMetricsNamespace}),
+			WithMinimalObject(gvk.ServiceMonitorCoreos, types.NamespacedName{Name: tenantMetricsWorkloadName, Namespace: tenantMetricsNamespace}),
 			WithIgnoreNotFound(true),
 			WithWaitForDeletion(true),
 		)
@@ -1195,7 +1195,7 @@ func (tc *MonitoringTestCtx) ensureTenantMetricsEnvironment(t *testing.T) {
 	)
 
 	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitorCoreos, types.NamespacedName{
 			Name:      tenantMetricsWorkloadName,
 			Namespace: tenantMetricsNamespace,
 		}),
