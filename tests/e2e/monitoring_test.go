@@ -92,6 +92,7 @@ func (tc *MonitoringTestCtx) runBaseConfigurationTests(t *testing.T) {
 		tc.setupBaseMonitoring(t)
 
 		t.Run("Test Traces default content", tc.ValidateMonitoringCRDefaultTracesContent)
+		t.Run("Test active operand namespace and readiness contract", tc.ValidateMonitoringOperandNamespaceContract)
 	})
 }
 
@@ -310,7 +311,9 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 		{gvk.MonitoringStack, MonitoringStackName, tc.MonitoringNamespace, "MonitoringStack", true, false},
 		{gvk.ClusterRoleBinding, "data-science-monitoringstack-alertmanager-prometheus-metrics-reader", "", "alertmanager ClusterRoleBinding", true, true},
 		{gvk.ClusterRoleBinding, "generate-processors-collector-rolebinding", "", "collector ClusterRoleBinding", false, true},
-		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-rolebinding", "", "TargetAllocator ClusterRoleBinding", false, true},
+		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-rolebinding", "", "legacy TargetAllocator ClusterRoleBinding", false, true},
+		{gvk.ClusterRole, "generate-processors-targetallocator-role", "", "TargetAllocator ClusterRole", false, true},
+		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-discovery-rolebinding", "", "TargetAllocator discovery ClusterRoleBinding", false, true},
 		{gvk.Service, "data-science-collector-prometheus", tc.MonitoringNamespace, "collector prometheus Service", true, true},
 		{gvk.ConfigMap, "prometheus-web-tls-ca", tc.MonitoringNamespace, "prometheus TLS CA ConfigMap", true, true},
 	}
@@ -402,6 +405,10 @@ func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 		tc = tc.WithT(t)
 
 		t.Run("Test OpenTelemetry Collector Configurations", tc.ValidateOpenTelemetryCollectorConfigurations)
+		// The configuration subtests reset optional Monitoring fields after each
+		// case, so restore metrics before validating the signal-specific contract.
+		tc.setupMetrics(t)
+		t.Run("Test signal-specific collector contract", tc.ValidateSignalSpecificCollectorContract)
 		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
 		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
 		t.Run("Test Monitoring TLS is always enabled for internal telemetry exporter", tc.ValidateMonitoringTLSAlwaysEnabled)
@@ -450,8 +457,9 @@ func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *tes
 			monitoringCondition: jq.Match(`.spec.metrics != null`),
 			validation: jq.Match(`
 				(.spec.config.exporters | has("prometheus") and has("debug") and has("%s")) and
-				(.spec.config.service.pipelines.metrics.exporters | length == 3 and contains(["prometheus", "debug", "%s"]))
-			`, OtlpCustomExporter, OtlpCustomExporter),
+				(.spec.config.service.pipelines."metrics/scrape".exporters | length == 3 and contains(["prometheus", "debug", "%s"])) and
+				(.spec.config.service.pipelines."metrics/otlp".exporters | length == 3 and contains(["prometheus", "debug", "%s"]))
+			`, OtlpCustomExporter, OtlpCustomExporter, OtlpCustomExporter),
 		},
 		{
 			name: "Custom Traces Exporters",
@@ -759,7 +767,9 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 		WithCondition(And(
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
-			jq.Match(`.spec.targetAllocator.mtls == null`),
+			jq.Match(`.spec.targetAllocator.mtls.enabled == true`),
+			jq.Match(`.spec.targetAllocator.mtls.useCertManager == true`),
+			jq.Match(`.spec.targetAllocator.allowInsecureAuthSecrets == false`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.denyFSAccessThroughSMs == true`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.secretNamespaces | contains(["%s"])`, tc.MonitoringNamespace),
@@ -780,6 +790,21 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 		)),
 		WithCustomErrorMsg("Target Allocator Deployment should be created and available"),
 	)
+
+	for _, certificateName := range []string{
+		TargetAllocatorCACertificateName,
+		TargetAllocatorClientCertificateName,
+		TargetAllocatorServerCertificateName,
+	} {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.CertManagerCertificate, types.NamespacedName{
+				Name:      certificateName,
+				Namespace: tc.MonitoringNamespace,
+			}),
+			WithCondition(jq.Match(`[.status.conditions[] | select(.type == "Ready" and .status == "True")] | length == 1`)),
+			WithCustomErrorMsg(fmt.Sprintf("Target Allocator certificate %s should be Ready", certificateName)),
+		)
+	}
 }
 
 // ValidateTargetAllocatorServiceAndConfigMap tests that the Target Allocator Service and ConfigMap are created correctly.
@@ -799,7 +824,10 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testi
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(
-			jq.Match(`.spec.ports[] | select(.name == "targetallocation") | .port == 80`),
+			And(
+				jq.Match(`.spec.ports[] | select(.name == "targetallocation") | .port == 80`),
+				jq.Match(`.spec.ports[] | select(.name == "targetallocation-https") | .port == 443`),
+			),
 		),
 		WithCustomErrorMsg("Target Allocator Service should be created"),
 	)
@@ -891,13 +919,13 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 			Name: "generate-processors-role",
 		}),
 		WithCondition(And(
-			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .resources | contains(["podmonitors", "servicemonitors"])`),
-			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .verbs | contains(["get", "list", "watch"])`),
-			jq.Match(`[.rules[] | select(.apiGroups[] == "") | select(.resources | contains(["secrets"]))] | length == 0`),
-			jq.Match(`.rules[] | select(.apiGroups[] == "") | .resources | contains(["endpoints"])`),
-			jq.Match(`.rules[] | select(.apiGroups[] == "") | .verbs | contains(["get", "list", "watch"])`),
-			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .resources | contains(["endpointslices"])`),
-			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .resources | contains(["podmonitors", "servicemonitors"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`[.rules[] | select((.apiGroups // []) | contains([""])) | select(.resources | contains(["secrets"]))] | length == 0`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains([""])) | .resources | contains(["endpoints"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains([""])) | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["discovery.k8s.io"])) | .resources | contains(["endpointslices"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["discovery.k8s.io"])) | .verbs | contains(["get", "list", "watch"])`),
 		)),
 		WithCustomErrorMsg("collector discovery ClusterRole should not grant Secret access"),
 	)
@@ -911,7 +939,38 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
-		WithCustomErrorMsg("ClusterRoleBinding should bind discovery permissions to the TargetAllocator ServiceAccount"),
+		WithCustomErrorMsg("legacy TargetAllocator ClusterRoleBinding should retain its original role"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "generate-processors-targetallocator-discovery-rolebinding",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "generate-processors-targetallocator-role"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("TargetAllocator discovery ClusterRoleBinding should grant the dedicated role"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "generate-processors-targetallocator-role",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .resources | contains(["podmonitors", "servicemonitors", "scrapeconfigs"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`[.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .resources | contains(["probes"])] | any`),
+			jq.Match(`[.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .verbs | contains(["get", "list", "watch"])] | any`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains([""])) | .resources | contains(["nodes", "nodes/metrics", "services", "endpoints", "pods", "namespaces"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains([""])) | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`[.rules[] | select((.apiGroups // []) | contains([""])) | .resources | contains(["configmaps"])] | any`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["discovery.k8s.io"])) | .resources | contains(["endpointslices"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["networking.k8s.io"])) | .resources | contains(["ingresses"])`),
+			jq.Match(`.rules[] | select(.nonResourceURLs != null) | .nonResourceURLs | contains(["/metrics", "/api", "/api/*", "/apis", "/apis/*"])`),
+		)),
+		WithCustomErrorMsg("TargetAllocator ClusterRole should grant the OpenTelemetry Operator discovery permissions"),
 	)
 
 	tc.EnsureResourceExists(
@@ -1426,6 +1485,7 @@ func (tc *MonitoringTestCtx) runTracesWithPVBackendTests(t *testing.T) {
 		t.Run("Test TempoMonolithic CR Creation with PV backend", tc.ValidateTempoMonolithicCRCreation)
 		t.Run("Test Collector MLflow integration RBAC", tc.ValidateCollectorMLflowIntegrationRBAC)
 		t.Run("Test Collector Tempo trace export RBAC", tc.ValidateCollectorTempoTraceExportRBAC)
+		t.Run("Test Tempo gateway tenant and authentication wiring", tc.ValidateTempoGatewayTenantConfiguration)
 	})
 }
 
@@ -2215,10 +2275,11 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/managed-by"] == "perses-operator"`),
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/name"] == "data-science-perses"`),
 			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
-			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-cluster-observability-operator"`),
-			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
-			jq.Match(`.spec.ingress[0].from[1].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-operators"`),
-			jq.Match(`.spec.ingress[0].from[1].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
+			jq.Match(`.spec.ingress[0].from | length == 3`),
+			jq.Match(`[.spec.ingress[0].from[].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]] | any(. == "openshift-cluster-observability-operator")`),
+			jq.Match(`[.spec.ingress[0].from[].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]] | any(. == "openshift-operators")`),
+			jq.Match(`[.spec.ingress[0].from[].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]] | any(. == "openshift-operators-redhat")`),
+			jq.Match(`[.spec.ingress[0].from[] | select(.podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator")] | length == 3`),
 			jq.Match(`.spec.ingress[0].ports[0].protocol == "TCP"`),
 			jq.Match(`.spec.ingress[0].ports[0].port == 8080`),
 		)),
@@ -2338,6 +2399,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
+			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
 			jq.Match(`.spec.config.default == false`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
@@ -2351,6 +2413,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
+			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
 			jq.Match(`.spec.config.default == true`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
@@ -2437,6 +2500,8 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 
 		t.Run("Prometheus restricted resource configuration", tc.ValidatePrometheusRestrictedResourceConfiguration)
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
+		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
+		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
 		t.Run("Operator metrics authentication and authorization", tc.ValidateOperatorMetricsAuthenticationAndAuthorization)

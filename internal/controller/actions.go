@@ -84,6 +84,7 @@ const (
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
 	ClusterLogForwarderTemplate                      = "resources/cluster-log-forwarder.tmpl.yaml"
 	ClusterLogForwarderRBACTemplate                  = "resources/cluster-log-forwarder-rbac.tmpl.yaml"
+	ClusterLogForwarderNetworkPolicyTemplate         = "resources/cluster-log-forwarder-network-policy.tmpl.yaml"
 	Korrel8rDeploymentTemplate                       = "resources/korrel8r-deployment.tmpl.yaml"
 	Korrel8rConfigTemplate                           = "resources/korrel8r-config.tmpl.yaml"
 	Korrel8rRBACTemplate                             = "resources/korrel8r-rbac.tmpl.yaml"
@@ -92,11 +93,14 @@ const (
 	PersesTempoDatasourceName = "tempo-datasource"
 	PersesTempoDashboardName  = "data-science-tempo-traces"
 
-	defaultMonitoringNamespace = "opendatahub"
-	clusterLoggingNamespace    = "openshift-logging"
-	Korrel8rServiceName        = "korrel8r"
-	conditionTypeReady         = "Ready"
-	conditionStatusTrue        = "True"
+	defaultMonitoringNamespace           = "opendatahub"
+	clusterLoggingNamespace              = "openshift-logging"
+	lokiStackResourceName                = "data-science-lokistack"
+	clusterLogForwarderResourceName      = "data-science-cluster-log-forwarder"
+	Korrel8rServiceName                  = "korrel8r"
+	ClusterLogForwarderNetworkPolicyName = "data-science-cluster-log-forwarder-allow"
+	conditionTypeReady                   = "Ready"
+	conditionStatusTrue                  = "True"
 )
 
 //go:embed resources monitoring
@@ -637,6 +641,15 @@ func deployClusterLogForwarder(
 		return nil
 	}
 
+	// Keep the CLF resources in the desired state while Loki is starting or
+	// recovering. Otherwise garbage collection treats them as stale and
+	// removes the cross-namespace resources during a transient Loki outage.
+	*sources = append(*sources,
+		src(ClusterLogForwarderTemplate),
+		src(ClusterLogForwarderRBACTemplate),
+		src(ClusterLogForwarderNetworkPolicyTemplate),
+	)
+
 	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
@@ -661,10 +674,6 @@ func deployClusterLogForwarder(
 			"ClusterLogForwarder is not ready yet")
 	}
 
-	*sources = append(*sources,
-		src(ClusterLogForwarderTemplate),
-		src(ClusterLogForwarderRBACTemplate),
-	)
 	return nil
 }
 
@@ -829,7 +838,7 @@ func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1
 	lokiStack.SetGroupVersionKind(gvk.LokiStack)
 
 	err := c.Get(ctx, types.NamespacedName{
-		Name:      "data-science-lokistack",
+		Name:      lokiStackResourceName,
 		Namespace: monitoringNamespace(monitoring),
 	}, lokiStack)
 	if err != nil {
@@ -852,7 +861,7 @@ func isClusterLogForwarderReady(ctx context.Context, c client.Client) (bool, err
 	clusterLogForwarder.SetGroupVersionKind(gvk.ClusterLogForwarder)
 
 	err := c.Get(ctx, types.NamespacedName{
-		Name:      "data-science-cluster-log-forwarder",
+		Name:      clusterLogForwarderResourceName,
 		Namespace: clusterLoggingNamespace,
 	}, clusterLogForwarder)
 	if err != nil {

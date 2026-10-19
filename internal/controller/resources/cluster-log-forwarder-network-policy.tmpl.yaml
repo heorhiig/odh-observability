@@ -1,0 +1,70 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{.ClusterLogForwarderNetworkPolicyName}}
+  namespace: {{.ClusterLoggingNamespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: collector
+      app.kubernetes.io/instance: {{.ClusterLogForwarderName}}
+      app.kubernetes.io/name: vector
+      app.kubernetes.io/part-of: cluster-logging
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: prometheus
+          app.kubernetes.io/instance: k8s
+          app.kubernetes.io/name: prometheus
+    ports:
+    - protocol: TCP
+      port: 24231
+  egress:
+  # Vector resolves and uses the cluster DNS service for Loki and API names.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: UDP
+      port: 5353
+    - protocol: TCP
+      port: 53
+    - protocol: TCP
+      port: 5353
+  # API endpoint addresses are discovered from the Kubernetes Service
+  # EndpointSlices. Node-sourced paths that bypass these endpoints are not
+  # representable by standard NetworkPolicy and remain outside this rule.
+  {{ if .KubernetesAPIServerCIDRs }}
+  - to:
+    {{ range .KubernetesAPIServerCIDRs }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{ end }}
+    ports:
+    - protocol: TCP
+      port: 6443
+  {{ end }}
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{.Namespace}}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: lokistack-gateway
+          app.kubernetes.io/instance: {{.LokiStackName}}
+          app.kubernetes.io/name: lokistack
+    ports:
+    - protocol: TCP
+      port: 8080

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -75,14 +76,18 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 }
 
 //nolint:gocyclo // The test validates the complete rendered scrape configuration.
-func TestPrometheusScrapeConfigExcludesEPPSchedulerPods(t *testing.T) {
+func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
 	if err != nil || !found {
 		t.Fatalf("target allocator config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
-	if _, found, err := unstructured.NestedMap(targetAllocator, "mtls"); err != nil || found {
-		t.Fatalf("target allocator mTLS must be omitted for the non-mTLS metrics path: found=%t, error=%v", found, err)
+	mtls, found, err := unstructured.NestedMap(targetAllocator, "mtls")
+	if err != nil || !found || mtls["enabled"] != true || mtls["useCertManager"] != true {
+		t.Fatalf("target allocator mTLS must be enabled with cert-manager: found=%t, config=%v, error=%v", found, mtls, err)
+	}
+	if targetAllocator["allowInsecureAuthSecrets"] != false {
+		t.Errorf("target allocator must disable auth secrets over plaintext HTTP, got %v", targetAllocator["allowInsecureAuthSecrets"])
 	}
 
 	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
@@ -195,13 +200,411 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 		}
 	}
 
-	pipelines, found, err := unstructured.NestedMap(config, "service", "pipelines", "metrics")
+	for name, pipeline := range metricsPipelines(t, collector) {
+		if !containsString(pipeline["processors"], "transform/gpu_metrics") {
+			t.Errorf("metrics pipeline %q must invoke the GPU metric transform processor", name)
+		}
+	}
+}
+
+// TestCollectorStripsWorkloadSuppliedK8sLabelAttributes guards the trust
+// boundary of the namespace/pod label promotion configured by the collector
+// ServiceMonitor's metricRelabelings: workloads control their exposition
+// labels, so datapoint attributes named k8s_namespace_name/k8s_pod_name must
+// never survive to export. The transform processor makes the k8sattributes
+// resource attributes the sole source of those labels.
+func TestCollectorStripsWorkloadSuppliedK8sLabelAttributes(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
 	if err != nil || !found {
-		t.Fatalf("metrics pipeline must be present: found=%t, error=%v", found, err)
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
-	if !containsString(pipelines["processors"], "transform/gpu_metrics") {
-		t.Error("metrics pipeline must invoke the GPU metric transform processor")
+	processors, found, err := unstructured.NestedMap(config, "processors")
+	if err != nil || !found {
+		t.Fatalf("collector processors must be present: found=%t, error=%v", found, err)
 	}
+	transform, found, err := unstructured.NestedMap(processors, "transform/sanitize_k8s_labels")
+	if err != nil || !found {
+		t.Fatalf("k8s label sanitize transform processor must be present: found=%t, error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 1 {
+		t.Fatalf("k8s label sanitize transform must contain one metric statement block (datapoint), got %v", transform["metric_statements"])
+	}
+	statementBlock, ok := metricStatements[0].(map[string]any)
+	if !ok {
+		t.Fatalf("k8s label sanitize statement block has unexpected type: %T", metricStatements[0])
+	}
+	if statementBlock["context"] != "datapoint" {
+		t.Fatalf("k8s label sanitize statements must target the datapoint context, got %v", statementBlock["context"])
+	}
+	statements, ok := statementBlock["statements"].([]any)
+	if !ok {
+		t.Fatalf("k8s label sanitize statements have unexpected type: %T", statementBlock["statements"])
+	}
+	expectedStatements := []string{
+		`delete_key(attributes, "k8s_namespace_name")`,
+		`delete_key(attributes, "k8s_pod_name")`,
+	}
+	if len(statements) != len(expectedStatements) {
+		t.Fatalf("expected %d k8s label sanitize statements, got %d", len(expectedStatements), len(statements))
+	}
+	for index, expected := range expectedStatements {
+		if statements[index] != expected {
+			t.Errorf("k8s label sanitize statement %d: got %v, want %s", index, statements[index], expected)
+		}
+	}
+
+	for name, pipeline := range metricsPipelines(t, collector) {
+		pipelineProcessors, ok := pipeline["processors"].([]any)
+		if !ok {
+			t.Fatalf("metrics pipeline %q processors have unexpected type: %T", name, pipeline["processors"])
+		}
+		sanitizeIndex, batchIndex := -1, -1
+		for index, procName := range pipelineProcessors {
+			switch procName {
+			case "transform/sanitize_k8s_labels":
+				sanitizeIndex = index
+			case "batch":
+				batchIndex = index
+			}
+		}
+		if sanitizeIndex == -1 {
+			t.Errorf("metrics pipeline %q must invoke the k8s label sanitize transform processor", name)
+		}
+		if batchIndex == -1 || sanitizeIndex > batchIndex {
+			t.Errorf("k8s label sanitize transform must run in metrics pipeline %q before batch", name)
+		}
+	}
+}
+
+// TestSanitizeTransformExcludesDCGMExporterK8sLabels guards the DCGM
+// scope-out of the namespace/pod promotion: the dcgm-exporter scrape job's
+// k8s.namespace.name/k8s.pod.name resource attributes identify the exporter
+// pod in nvidia-gpu-operator, not the workload consuming the GPU, so they
+// must not be promoted to namespace/pod by the collector ServiceMonitor.
+// The resource-context statements delete them for that job, making the
+// promotion a no-op for accelerator series, while node/component are
+// preserved (Korrel8r correlates DCGM series by node). The processor runs
+// in the scrape pipeline only: an OTLP pusher controls service.name and
+// must not be able to use the DCGM job name to opt out of pod attribution.
+func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	processors, found, err := unstructured.NestedMap(config, "processors")
+	if err != nil || !found {
+		t.Fatalf("collector processors must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	transform, found, err := unstructured.NestedMap(processors, "transform/exclude_dcgm_k8s_labels")
+	if err != nil || !found {
+		t.Fatalf("DCGM k8s label exclusion transform processor must be present: found=%t, error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 1 {
+		t.Fatalf("DCGM k8s label exclusion transform must contain one metric statement block (resource), got %v", transform["metric_statements"])
+	}
+	resourceBlock, ok := metricStatements[0].(map[string]any)
+	if !ok {
+		t.Fatalf("DCGM k8s label exclusion statement block has unexpected type: %T", metricStatements[0])
+	}
+	if resourceBlock["context"] != "resource" {
+		t.Fatalf("DCGM k8s label exclusion statements must target the resource context, got %v", resourceBlock["context"])
+	}
+	statements, ok := resourceBlock["statements"].([]any)
+	if !ok {
+		t.Fatalf("resource-context statements have unexpected type: %T", resourceBlock["statements"])
+	}
+
+	// The DCGM job name scoping the statements must match the job target
+	// label assigned by the dcgm scrape job's relabeling, so renaming one
+	// without the other fails here.
+	dcgmJobName := dcgmScrapeJobName(t, collector)
+	expectedStatements := []string{
+		fmt.Sprintf(`delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == %q`, dcgmJobName),
+		fmt.Sprintf(`delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == %q`, dcgmJobName),
+	}
+	if len(statements) != len(expectedStatements) {
+		t.Fatalf("expected %d resource-context statements, got %d", len(expectedStatements), len(statements))
+	}
+	for index, expected := range expectedStatements {
+		if statements[index] != expected {
+			t.Errorf("resource-context statement %d: got %v, want %s", index, statements[index], expected)
+		}
+	}
+	for _, statement := range statements {
+		if strings.Contains(fmt.Sprint(statement), "k8s.node.name") {
+			t.Errorf("resource-context statements must not delete k8s.node.name (Korrel8r correlates DCGM series by node): %v", statement)
+		}
+	}
+
+	pipelines := metricsPipelines(t, collector)
+	if !containsString(pipelines["metrics/scrape"]["processors"], "transform/exclude_dcgm_k8s_labels") {
+		t.Error("metrics/scrape pipeline must invoke the DCGM k8s label exclusion processor")
+	}
+	if containsString(pipelines["metrics/otlp"]["processors"], "transform/exclude_dcgm_k8s_labels") {
+		t.Error("metrics/otlp pipeline must not invoke the DCGM k8s label exclusion processor: an OTLP pusher controls service.name")
+	}
+}
+
+// metricsPipelines returns every rendered metrics pipeline keyed by its
+// configuration name, failing the test unless both the scrape and OTLP
+// pipelines exist.
+func metricsPipelines(t *testing.T, collector unstructured.Unstructured) map[string]map[string]any {
+	t.Helper()
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	pipelines, found, err := unstructured.NestedMap(config, "service", "pipelines")
+	if err != nil || !found {
+		t.Fatalf("service pipelines must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+
+	result := make(map[string]map[string]any, 2)
+	for _, name := range []string{"metrics/scrape", "metrics/otlp"} {
+		pipeline, ok := pipelines[name].(map[string]any)
+		if !ok {
+			t.Fatalf("metrics pipeline %q must be present in rendered resource", name)
+		}
+		result[name] = pipeline
+	}
+	return result
+}
+
+// renderedProcessors returns the processors section of the rendered
+// collector, failing the test unless it is present.
+func renderedProcessors(t *testing.T, collector unstructured.Unstructured) map[string]any {
+	t.Helper()
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	processors, found, err := unstructured.NestedMap(config, "processors")
+	if err != nil || !found {
+		t.Fatalf("collector processors must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	return processors
+}
+
+// TestOTLPPipelineSanitizesClientSuppliedIdentity guards the OTLP metrics
+// trust boundary. Pushers control the resource attributes they send, and the
+// collector ServiceMonitor promotes k8s.namespace.name/k8s.pod.name (exported
+// as k8s_namespace_name/k8s_pod_name) to namespace/pod, so the OTLP
+// pipeline's sanitizer must strip every spelling of client-supplied identity
+// attributes before enrichment runs, and its k8sattributes/otlp processor
+// must associate pods from the network connection only: the default
+// association would consult client-supplied k8s.pod.ip first.
+func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	processors := renderedProcessors(t, collector)
+
+	k8sAttributes, found, err := unstructured.NestedMap(processors, "k8sattributes/otlp")
+	if err != nil || !found {
+		t.Fatalf("k8sattributes/otlp processor must be present: found=%t, error=%v", found, err)
+	}
+	associations, found, err := unstructured.NestedSlice(k8sAttributes, "pod_association")
+	if err != nil || !found || len(associations) != 1 {
+		t.Fatalf("k8sattributes/otlp must configure exactly one pod association rule: found=%t, rules=%v, error=%v", found, associations, err)
+	}
+	rule, ok := associations[0].(map[string]any)
+	if !ok {
+		t.Fatalf("k8sattributes/otlp pod association rule has unexpected type: %T", associations[0])
+	}
+	sources, found, err := unstructured.NestedSlice(rule, "sources")
+	if err != nil || !found || len(sources) != 1 {
+		t.Fatalf("k8sattributes/otlp association rule must have exactly one source: found=%t, sources=%v, error=%v", found, sources, err)
+	}
+	source, ok := sources[0].(map[string]any)
+	if !ok {
+		t.Fatalf("k8sattributes/otlp association source has unexpected type: %T", sources[0])
+	}
+	if source["from"] != "connection" {
+		t.Errorf("k8sattributes/otlp must associate pods from the network connection only, got source %v", source)
+	}
+
+	transform, found, err := unstructured.NestedMap(processors, "transform/sanitize_otlp_identity")
+	if err != nil || !found {
+		t.Fatalf("OTLP identity sanitize transform processor must be present: found=%t, error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 2 {
+		t.Fatalf("OTLP identity sanitize transform must contain two metric statement blocks (resource and datapoint), got %v", transform["metric_statements"])
+	}
+	blocks := statementBlocksByContext(t, metricStatements)
+	resourceBlock, datapointBlock := blocks["resource"], blocks["datapoint"]
+	if resourceBlock == nil {
+		t.Fatal("OTLP identity sanitize transform must contain a resource statement block")
+	}
+	if datapointBlock == nil {
+		t.Fatal("OTLP identity sanitize transform must contain a datapoint statement block")
+	}
+	requireStatements(t, "OTLP identity sanitize resource", resourceBlock, []string{
+		`delete_key(attributes, "k8s.namespace.name")`,
+		`delete_key(attributes, "k8s.pod.name")`,
+		`delete_key(attributes, "k8s.pod.uid")`,
+		`delete_key(attributes, "k8s.pod.ip")`,
+		`delete_key(attributes, "k8s.pod.start_time")`,
+		`delete_key(attributes, "k8s.node.name")`,
+		`delete_key(attributes, "k8s.deployment.name")`,
+		`delete_key(attributes, "k8s.container.name")`,
+		`delete_key(attributes, "container.id")`,
+		`delete_key(attributes, "k8s_namespace_name")`,
+		`delete_key(attributes, "k8s_pod_name")`,
+		`delete_key(attributes, "namespace")`,
+		`delete_key(attributes, "pod")`,
+		`delete_key(attributes, "exported_namespace")`,
+		`delete_key(attributes, "exported_pod")`,
+	})
+	requireStatements(t, "OTLP identity sanitize datapoint", datapointBlock, []string{
+		`delete_key(attributes, "namespace")`,
+		`delete_key(attributes, "pod")`,
+		`delete_key(attributes, "exported_namespace")`,
+		`delete_key(attributes, "exported_pod")`,
+	})
+}
+
+// TestOTLPMetricsPipelineWiring guards the pipeline split itself: OTLP
+// metrics must enter through metrics/otlp so they cannot bypass the identity
+// sanitizer, scrape metrics must not pass through it, the sanitizer must run
+// before enrichment, and both pipelines must share exporters.
+func TestOTLPMetricsPipelineWiring(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+
+	pipelines := metricsPipelines(t, collector)
+	scrapePipeline, otlpPipeline := pipelines["metrics/scrape"], pipelines["metrics/otlp"]
+
+	otlpReceivers, ok := otlpPipeline["receivers"].([]any)
+	if !ok {
+		t.Fatalf("metrics/otlp pipeline receivers have unexpected type: %T", otlpPipeline["receivers"])
+	}
+	if !containsString(otlpReceivers, "otlp") || len(otlpReceivers) != 1 {
+		t.Errorf("metrics/otlp pipeline must receive OTLP only, got %v", otlpReceivers)
+	}
+	if !containsString(scrapePipeline["receivers"], "prometheus") {
+		t.Errorf("metrics/scrape pipeline must receive the prometheus receiver, got %v", scrapePipeline["receivers"])
+	}
+	if containsString(scrapePipeline["receivers"], "otlp") {
+		t.Error("metrics/scrape pipeline must not receive OTLP: pushed metrics must not bypass the identity sanitizer")
+	}
+
+	otlpProcessors, ok := otlpPipeline["processors"].([]any)
+	if !ok {
+		t.Fatalf("metrics/otlp pipeline processors have unexpected type: %T", otlpPipeline["processors"])
+	}
+	sanitizeIndex, enrichIndex := -1, -1
+	for index, name := range otlpProcessors {
+		switch name {
+		case "transform/sanitize_otlp_identity":
+			sanitizeIndex = index
+		case "k8sattributes/otlp":
+			enrichIndex = index
+		}
+	}
+	if sanitizeIndex == -1 {
+		t.Fatal("metrics/otlp pipeline must invoke the OTLP identity sanitize transform processor")
+	}
+	if enrichIndex == -1 {
+		t.Fatal("metrics/otlp pipeline must invoke the k8sattributes/otlp processor")
+	}
+	if sanitizeIndex > enrichIndex {
+		t.Error("OTLP identity sanitize transform must run before k8sattributes/otlp enrichment")
+	}
+
+	if containsString(scrapePipeline["processors"], "transform/sanitize_otlp_identity") {
+		t.Error("metrics/scrape pipeline must not invoke the OTLP identity sanitizer: its k8s attributes come from trusted discovery metadata")
+	}
+	if containsString(scrapePipeline["processors"], "k8sattributes/otlp") {
+		t.Error("metrics/scrape pipeline must keep the shared k8sattributes processor, not the OTLP-specific one")
+	}
+	if !containsString(scrapePipeline["processors"], "k8sattributes") {
+		t.Error("metrics/scrape pipeline must invoke the shared k8sattributes processor")
+	}
+
+	if !reflect.DeepEqual(scrapePipeline["exporters"], otlpPipeline["exporters"]) {
+		t.Errorf("metrics pipelines must share exporters, scrape=%v otlp=%v", scrapePipeline["exporters"], otlpPipeline["exporters"])
+	}
+}
+
+// statementBlocksByContext indexes a transform's metric_statements blocks by
+// their context name.
+func statementBlocksByContext(t *testing.T, metricStatements []any) map[string]map[string]any {
+	t.Helper()
+
+	blocks := make(map[string]map[string]any, len(metricStatements))
+	for _, rawBlock := range metricStatements {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			t.Fatalf("transform statement block has unexpected type: %T", rawBlock)
+		}
+		context, _ := block["context"].(string)
+		blocks[context] = block
+	}
+	return blocks
+}
+
+// requireStatements asserts that a transform statement block carries exactly
+// the expected OTTL statements, in order.
+func requireStatements(t *testing.T, description string, block map[string]any, expected []string) {
+	t.Helper()
+
+	statements, ok := block["statements"].([]any)
+	if !ok {
+		t.Fatalf("%s statements have unexpected type: %T", description, block["statements"])
+	}
+	if len(statements) != len(expected) {
+		t.Fatalf("expected %d %s statements, got %d", len(expected), description, len(statements))
+	}
+	for index, want := range expected {
+		if statements[index] != want {
+			t.Errorf("%s statement %d: got %v, want %s", description, index, statements[index], want)
+		}
+	}
+}
+
+// dcgmScrapeJobName returns the job label value the dcgm scrape job's
+// relabeling assigns; the prometheus receiver exposes it as the service.name
+// resource attribute.
+func dcgmScrapeJobName(t *testing.T, collector unstructured.Unstructured) string {
+	t.Helper()
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	if err != nil || !found {
+		t.Fatalf("expected scrape configs in rendered resource: found=%t, error=%v", found, err)
+	}
+	for _, rawScrapeConfig := range scrapeConfigs {
+		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
+		if !ok || scrapeConfig["job_name"] != "dcgm-exporter-accelerator-metrics" {
+			continue
+		}
+		relabelConfigs, found, err := unstructured.NestedSlice(scrapeConfig, "relabel_configs")
+		if err != nil || !found {
+			t.Fatalf("DCGM relabel configs must be present: found=%t, error=%v", found, err)
+		}
+		for _, rawRule := range relabelConfigs {
+			rule, ok := rawRule.(map[string]any)
+			if !ok || rule["target_label"] != "job" {
+				continue
+			}
+			jobName, _ := rule["replacement"].(string)
+			if jobName == "" {
+				t.Fatalf("DCGM job relabel rule must set a replacement: %v", rule)
+			}
+			return jobName
+		}
+		t.Fatal("DCGM scrape config must assign a job target label")
+	}
+	t.Fatal("DCGM scrape config must be present")
+	return ""
 }
 
 func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {

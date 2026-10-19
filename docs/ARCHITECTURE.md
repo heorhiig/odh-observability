@@ -45,14 +45,15 @@ Before any feature deployment, the reconciler verifies prerequisite operators th
 | `cluster-observability-operator` | Metrics configured |
 | `tempo-operator` | Traces configured |
 | `opentelemetry-operator` | Metrics, traces, or usage logs configured |
+| `cert-manager` | Operator webhook and metrics TargetAllocator mTLS certificates |
 | `loki-operator` | Usage logs or cluster log forwarding configured |
 | `cluster-logging` | Cluster log forwarding configured |
 
 If any required operator is missing, `MonitoringDependenciesReady` is set to False with the missing operator names and OperatorHub installation guidance. Reconciliation then stops without error (no retry -- the CRD watch will trigger re-reconciliation when operators are installed). The legacy `MonitoringAvailable` condition is updated in parallel for compatibility.
 
-The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives namespace-scoped Roles for the current namespace set and is configured with the same `secretNamespaces` allowlist; namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
+The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives the OpenTelemetry Operator discovery permissions through a dedicated ClusterRole plus namespace-scoped Roles for the current namespace set; an upgrade-safe legacy binding is retained because ClusterRoleBinding role references are immutable. It is configured with the same `secretNamespaces` allowlist, and namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
 
-The TargetAllocator currently uses its non-mTLS connection mode. TargetAllocator mTLS is deferred until the supported OpenTelemetry Operator webhook bundle can handle cert-manager-backed admission for this configuration.
+The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA, serving, and client certificates. The collector is configured only with the HTTPS TargetAllocator endpoint. The upstream TargetAllocator may also expose its non-mTLS discovery port, but `allowInsecureAuthSecrets` remains disabled so authenticated ServiceMonitor credentials cannot be returned over plaintext HTTP.
 
 ## Action Functions
 
@@ -110,7 +111,7 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | Template | Resources Created |
 |----------|-------------------|
 | `opentelemetry-collector.tmpl.yaml` | OpenTelemetryCollector CR |
-| `collector-rbac.tmpl.yaml` | Collector discovery RBAC, dedicated TargetAllocator ServiceAccount, and namespace-scoped Secret RBAC |
+| `collector-rbac.tmpl.yaml` | Collector discovery RBAC, dedicated TargetAllocator ServiceAccount, upgrade-safe discovery bindings, and namespace-scoped Secret RBAC |
 | `collector-servicemonitors.tmpl.yaml` | ServiceMonitors for collector metrics |
 | `collector-prometheus-service.tmpl.yaml` | Prometheus receiver service |
 
@@ -227,7 +228,7 @@ The `buildTemplateData()` function transforms the CR spec and cluster state into
 | Source | Data Produced |
 |--------|---------------|
 | CR spec | Namespace, feature flags (Metrics/Traces booleans), storage config, TLS config |
-| Environment variables | `POD_NAMESPACE`, `OPERATOR_NAME`, `RELATED_IMAGE_*` for operand images |
+| Environment variables | `POD_NAMESPACE`, `OPERATOR_NAME`, optional `GATEWAY_NAMESPACE`, and `RELATED_IMAGE_*` for operand images |
 | Cluster probing | SNO detection (single-node OpenShift), Perses API version (v1alpha1 vs v1alpha2) |
 | Defaults | Resource limits, retention periods, sample ratios, storage sizes |
 
@@ -308,7 +309,9 @@ Prometheus (port 9090)
 
 **Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries. Its single-value regex mode rejects duplicate namespace values supplied across URL and POST form parameters instead of widening the enforced matcher.
 
-**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the OpenShift router and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the OpenShift router.
+**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the configured gateway namespace and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the configured gateway namespace. `GATEWAY_NAMESPACE` supplies the namespace identity for deployment variants; when it is empty, the policies use the OpenShift ingress policy-group label rather than assuming a namespace.
+
+**API-server and webhook paths**: Korrel8r's egress policy allows only the ready Kubernetes API EndpointSlice addresses on TCP/6443 and records the node-sourced API-server path as an explicit exception. The mutating webhook has the same platform-managed exception because admission calls originate from the control plane and standard NetworkPolicy cannot reliably express that node source; the rendered `MutatingWebhookConfiguration` records `platform.opendatahub.io/webhook-network-policy=platform-managed-exception`. These annotations are descriptive contracts, not enforcement. The operator does not install a host-network NetworkPolicy or `AdminNetworkPolicy`; the owning control, when present, is the cluster platform/network-admin configuration for host-network or external control-plane traffic, scoped to the API-server/admission path. A cluster without that complementary control must be qualified live and reported as an explicit limitation.
 
 The external `data-science-thanos-querier-route` terminates at `data-science-thanos-querier-proxy` using re-encrypt TLS; it never targets the ThanosQuerier Service directly. The controller populates the Route's destination CA from the OpenShift service CA so the router validates the proxy's serving certificate. The Thanos proxy forwards the authorized and label-constrained request to the existing Thanos Querier on port `10902`, preserving the backend used by internal consumers.
 

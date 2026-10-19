@@ -23,8 +23,10 @@ import (
 	"testing"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -355,24 +357,66 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
-func TestPrometheusNamespaceProxyNetworkPolicyTemplateContract(t *testing.T) {
-	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyNetworkPolicyTemplate, proxyTemplateData())
-	policy := findRenderedResource(t, resources, "NetworkPolicy", "data-science-prometheus-proxy-ingress")
-	ingress := nestedSlice(t, policy, "spec", "ingress")
-	if len(ingress) < 1 {
-		t.Fatalf("Prometheus namespace proxy NetworkPolicy must have router ingress, got %d rules", len(ingress))
-	}
+func TestGatewayNetworkPolicyTemplatesUseDeploymentGatewayNamespace(t *testing.T) {
+	t.Parallel()
 
-	firstRule := asMap(t, ingress[0])
-	fromValues, ok := firstRule["from"].([]any)
-	if !ok || len(fromValues) != 1 {
-		t.Fatalf("Prometheus namespace proxy NetworkPolicy router ingress must have one source, got %#v", firstRule["from"])
+	variants := []struct {
+		name             string
+		gatewayNamespace string
+	}{
+		{name: "ODH", gatewayNamespace: "openshift-ingress"},
+		{name: "RHOAI", gatewayNamespace: "redhat-ods-applications"},
 	}
-	from := asMap(t, fromValues[0])
-	namespaceSelector := asMap(t, from["namespaceSelector"])
-	matchLabels := asMap(t, namespaceSelector["matchLabels"])
-	if len(matchLabels) != 1 || matchLabels["policy-group.network.openshift.io/ingress"] != "" {
-		t.Fatalf("Prometheus namespace proxy NetworkPolicy must select the OpenShift ingress policy group: %#v", matchLabels)
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := proxyTemplateData()
+			data["GatewayNamespace"] = variant.gatewayNamespace
+			for _, template := range []string{
+				PrometheusNamespaceProxyNetworkPolicyTemplate,
+				ThanosQuerierProxyNetworkPolicyTemplate,
+			} {
+				resources := renderObservabilityTemplate(t, template, data)
+				policyName := "data-science-prometheus-proxy-ingress"
+				if template == ThanosQuerierProxyNetworkPolicyTemplate {
+					policyName = "data-science-thanos-querier-proxy-ingress"
+				}
+				policy := findRenderedResource(t, resources, "NetworkPolicy", policyName)
+				ingress := nestedSlice(t, policy, "spec", "ingress")
+				if len(ingress) == 0 {
+					t.Fatalf("%s must have gateway ingress", policyName)
+				}
+
+				firstRule := asMap(t, ingress[0])
+				fromValues, ok := firstRule["from"].([]any)
+				if !ok || len(fromValues) != 1 {
+					t.Fatalf("%s gateway ingress must have one source, got %#v", policyName, firstRule["from"])
+				}
+				from := asMap(t, fromValues[0])
+				if len(from) != 1 {
+					t.Fatalf("%s gateway ingress must not include an unrestricted peer: %#v", policyName, from)
+				}
+				namespaceSelector := asMap(t, from["namespaceSelector"])
+				matchLabels := asMap(t, namespaceSelector["matchLabels"])
+				wantLabels := map[string]any{"kubernetes.io/metadata.name": variant.gatewayNamespace}
+				if !reflect.DeepEqual(matchLabels, wantLabels) {
+					t.Fatalf("%s must select configured gateway namespace: want %#v, got %#v", policyName, wantLabels, matchLabels)
+				}
+				policyTypes := nestedSlice(t, policy, "spec", "policyTypes")
+				if len(policyTypes) != 1 || policyTypes[0] != "Ingress" {
+					t.Fatalf("%s must be ingress-only, got %#v", policyName, policyTypes)
+				}
+				ports, ok := firstRule["ports"].([]any)
+				if !ok || len(ports) != 1 {
+					t.Fatalf("%s gateway rule must have one port, got %#v", policyName, ports)
+				}
+				port := asMap(t, ports[0])
+				if port["protocol"] != "TCP" || port["port"] != int64(8443) {
+					t.Fatalf("%s gateway rule must allow only TCP/8443, got %#v", policyName, port)
+				}
+			}
+		})
 	}
 }
 
@@ -398,6 +442,81 @@ func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
+func TestClusterLogForwarderNetworkPolicyTemplateContract(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, ClusterLogForwarderNetworkPolicyTemplate, map[string]any{
+		"ClusterLogForwarderName":              "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderNetworkPolicyName": ClusterLogForwarderNetworkPolicyName,
+		"ClusterLoggingNamespace":              "openshift-logging",
+		"KubernetesAPIServerCIDRs":             []string{"172.20.0.1/32"},
+		"LokiStackName":                        "data-science-lokistack",
+		"Namespace":                            testMonitoringNamespace,
+	})
+
+	policy := findRenderedResource(t, resources, "NetworkPolicy", ClusterLogForwarderNetworkPolicyName)
+	if policy.GetNamespace() != "openshift-logging" {
+		t.Fatalf("Vector NetworkPolicy must live in openshift-logging, got %q", policy.GetNamespace())
+	}
+
+	selector, found, err := unstructured.NestedStringMap(policy.Object, "spec", "podSelector", "matchLabels")
+	if err != nil || !found {
+		t.Fatalf("Vector NetworkPolicy selector is missing: found=%t error=%v", found, err)
+	}
+	wantSelector := map[string]string{
+		"app.kubernetes.io/component": "collector",
+		"app.kubernetes.io/instance":  "data-science-cluster-log-forwarder",
+		"app.kubernetes.io/name":      "vector",
+		"app.kubernetes.io/part-of":   "cluster-logging",
+	}
+	if !reflect.DeepEqual(selector, wantSelector) {
+		t.Fatalf("Vector NetworkPolicy selector: want %#v, got %#v", wantSelector, selector)
+	}
+
+	var rendered networkingv1.NetworkPolicy
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(policy.Object, &rendered); err != nil {
+		t.Fatalf("converting Vector NetworkPolicy: %v", err)
+	}
+	if !reflect.DeepEqual(rendered.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}) {
+		t.Fatalf("Vector NetworkPolicy policy types: got %v", rendered.Spec.PolicyTypes)
+	}
+	if len(rendered.Spec.Ingress) != 1 || len(rendered.Spec.Ingress[0].From) != 1 || len(rendered.Spec.Ingress[0].Ports) != 1 {
+		t.Fatalf("Vector NetworkPolicy must have one explicit Prometheus ingress peer and port: %#v", rendered.Spec.Ingress)
+	}
+	ingressPeer := rendered.Spec.Ingress[0].From[0]
+	if ingressPeer.NamespaceSelector == nil || ingressPeer.PodSelector == nil {
+		t.Fatalf("Vector NetworkPolicy Prometheus peer must select both namespace and pod: %#v", ingressPeer)
+	}
+	if got := ingressPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"]; got != "openshift-monitoring" {
+		t.Fatalf("Vector NetworkPolicy Prometheus namespace: got %q", got)
+	}
+	if got := ingressPeer.PodSelector.MatchLabels["app.kubernetes.io/instance"]; got != "k8s" {
+		t.Fatalf("Vector NetworkPolicy Prometheus instance: got %q", got)
+	}
+	if rendered.Spec.Ingress[0].Ports[0].Port == nil || rendered.Spec.Ingress[0].Ports[0].Port.IntValue() != 24231 {
+		t.Fatalf("Vector NetworkPolicy must allow metrics TCP/24231: %#v", rendered.Spec.Ingress[0].Ports)
+	}
+
+	if len(rendered.Spec.Egress) != 3 {
+		t.Fatalf("Vector NetworkPolicy must have DNS, API, and Loki egress rules: %#v", rendered.Spec.Egress)
+	}
+	if !networkPolicyAllowsEgress(&rendered, "172.20.0.1/32", 6443) {
+		t.Fatalf("Vector NetworkPolicy must allow the discovered Kubernetes API endpoint: %#v", rendered.Spec.Egress)
+	}
+	if !networkPolicyAllowsPort(rendered.Spec.Egress[0], 53) || !networkPolicyAllowsPort(rendered.Spec.Egress[0], 5353) {
+		t.Fatalf("Vector NetworkPolicy must allow DNS ports 53 and 5353: %#v", rendered.Spec.Egress[0])
+	}
+	lokiPeer := rendered.Spec.Egress[2].To[0]
+	if lokiPeer.NamespaceSelector == nil || lokiPeer.PodSelector == nil ||
+		lokiPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != testMonitoringNamespace ||
+		lokiPeer.PodSelector.MatchLabels["app.kubernetes.io/component"] != "lokistack-gateway" {
+		t.Fatalf("Vector NetworkPolicy Loki peer is not restricted to the gateway: %#v", lokiPeer)
+	}
+	if !networkPolicyAllowsPort(rendered.Spec.Egress[2], 8080) {
+		t.Fatalf("Vector NetworkPolicy must allow Loki gateway TCP/8080: %#v", rendered.Spec.Egress[2])
+	}
+}
+
 func TestPersesOperatorAccessNetworkPolicyTemplateContract(t *testing.T) {
 	t.Parallel()
 
@@ -414,6 +533,71 @@ func TestPersesOperatorAccessNetworkPolicyTemplateContract(t *testing.T) {
 	}
 	if err != nil || !found || !reflect.DeepEqual(selector, wantSelector) {
 		t.Fatalf("Perses access NetworkPolicy must select only the intended operand: got %#v, error=%v", selector, err)
+	}
+
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) != 1 {
+		t.Fatalf("Perses access NetworkPolicy must have one ingress rule, got %#v", ingress)
+	}
+
+	rule := asMap(t, ingress[0])
+	from, ok := rule["from"].([]any)
+	if !ok || len(from) != 3 {
+		t.Fatalf("Perses access NetworkPolicy must allow the supported Perses operator namespaces, got %#v", rule["from"])
+	}
+
+	wantNamespaces := map[string]struct{}{
+		"openshift-cluster-observability-operator": {},
+		"openshift-operators":                      {},
+		"openshift-operators-redhat":               {},
+	}
+	gotNamespaces := make(map[string]struct{}, len(from))
+	for i, rawFromRule := range from {
+		fromRule := asMap(t, rawFromRule)
+		if len(fromRule) != 2 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only namespaceSelector and podSelector, got %#v", i, fromRule)
+		}
+
+		namespaceSelector := asMap(t, fromRule["namespaceSelector"])
+		if len(namespaceSelector) != 1 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only matchLabels in namespaceSelector, got %#v", i, namespaceSelector)
+		}
+		matchLabels := asMap(t, namespaceSelector["matchLabels"])
+		if len(matchLabels) != 1 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only the namespace name label, got %#v", i, matchLabels)
+		}
+		namespaceName, ok := matchLabels["kubernetes.io/metadata.name"].(string)
+		if !ok {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d namespace name has unexpected type %T", i, matchLabels["kubernetes.io/metadata.name"])
+		}
+		if _, duplicate := gotNamespaces[namespaceName]; duplicate {
+			t.Fatalf("Perses access NetworkPolicy contains duplicate namespace %q", namespaceName)
+		}
+		gotNamespaces[namespaceName] = struct{}{}
+
+		podSelector := asMap(t, fromRule["podSelector"])
+		if len(podSelector) != 1 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only matchLabels in podSelector, got %#v", i, podSelector)
+		}
+		podMatchLabels := asMap(t, podSelector["matchLabels"])
+		if len(podMatchLabels) != 1 || podMatchLabels["app.kubernetes.io/name"] != "perses-operator" {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must select only perses-operator pods, got %#v", i, podMatchLabels)
+		}
+	}
+	if !reflect.DeepEqual(gotNamespaces, wantNamespaces) {
+		t.Fatalf("Perses access NetworkPolicy must allow exactly the supported Perses operator namespaces: want %#v, got %#v", wantNamespaces, gotNamespaces)
+	}
+
+	ports, ok := rule["ports"].([]any)
+	if !ok {
+		t.Fatalf("Perses access NetworkPolicy ports have unexpected type %T", rule["ports"])
+	}
+	if len(ports) != 1 {
+		t.Fatalf("Perses access NetworkPolicy must expose one port, got %#v", rule["ports"])
+	}
+	port := asMap(t, ports[0])
+	if port["protocol"] != "TCP" || port["port"] != int64(8080) {
+		t.Fatalf("Perses access NetworkPolicy must allow only TCP/8080, got %#v", port)
 	}
 }
 
@@ -817,6 +1001,7 @@ func assertPersesDatasourceQueryParameter(t *testing.T, datasource unstructured.
 func proxyTemplateData() map[string]any {
 	return map[string]any{
 		"Namespace":           testMonitoringNamespace,
+		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
 		"TLSMinVersion":       "VersionTLS12",
