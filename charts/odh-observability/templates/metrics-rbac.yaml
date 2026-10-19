@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "odh-observability.fullname" . }}-metrics-reader
+  name: odh-observability-metrics-reader
   labels:
     {{- include "odh-observability.labels" . | nindent 4 }}
 rules:
@@ -16,13 +16,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "odh-observability.fullname" . }}-metrics-reader
+  name: odh-observability-metrics-reader
   labels:
     {{- include "odh-observability.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "odh-observability.fullname" . }}-metrics-reader
+  name: odh-observability-metrics-reader 
 subjects:
   # Prometheus ServiceAccount created by the MonitoringStack in the monitoring namespace.
   # The MonitoringStack controller creates this ServiceAccount with the naming pattern:
