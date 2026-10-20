@@ -2876,8 +2876,8 @@ func (tc *MonitoringTestCtx) verifyOperatorMetricsRBAC(t *testing.T) {
 			Name: "odh-observability-metrics-reader",
 		}),
 		WithCondition(And(
-			jq.Match(`.rules[] | select(.nonResourceURLs[]? == "/metrics")`),
-			jq.Match(`.rules[] | select(.verbs[]? == "get")`),
+			jq.Match(`[.rules[] | select(.nonResourceURLs[]? == "/metrics")] | any`),
+			jq.Match(`[.rules[] | select(.verbs[]? == "get")] | any`),
 		)),
 		WithCustomErrorMsg("ClusterRole odh-observability-metrics-reader should grant GET on /metrics"),
 	)
@@ -2888,8 +2888,8 @@ func (tc *MonitoringTestCtx) verifyOperatorMetricsRBAC(t *testing.T) {
 		}),
 		WithCondition(And(
 			jq.Match(`.roleRef.name == "odh-observability-metrics-reader"`),
-			jq.Match(`.subjects[] | select(.kind == "ServiceAccount" and .name == "%s")`, fmt.Sprintf("%s-prometheus", MonitoringStackName)),
-			jq.Match(`.subjects[] | select(.namespace == "%s")`, tc.MonitoringNamespace),
+			jq.Match(`[.subjects[] | select(.kind == "ServiceAccount" and .name == "%s")] | any`, fmt.Sprintf("%s-prometheus", MonitoringStackName)),
+			jq.Match(`[.subjects[] | select(.namespace == "%s")] | any`, tc.MonitoringNamespace),
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should bind Prometheus SA to metrics-reader role"),
 	)
