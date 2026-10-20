@@ -36,6 +36,7 @@ import (
 const (
 	MonitoringStackName                  = "data-science-monitoringstack"
 	OpenTelemetryCollectorName           = "data-science-collector"
+	OpenTelemetryCollectorServiceName    = OpenTelemetryCollectorName + "-collector"
 	TargetAllocatorDeploymentName        = "data-science-collector-targetallocator"
 	TargetAllocatorCACertificateName     = OpenTelemetryCollectorName + "-ca-cert"
 	TargetAllocatorClientCertificateName = OpenTelemetryCollectorName + "-ta-client-cert"
