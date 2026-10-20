@@ -1274,6 +1274,47 @@ func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 		WithCustomErrorMsg("operator ServiceMonitor should be created after COO CRD is available"),
 	)
 
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			rules := []any{
+				map[string]any{
+					"nonResourceURLs": []any{"/metrics"},
+					"verbs":           []any{"get"},
+				},
+			}
+			return unstructured.SetNestedSlice(u.Object, rules, "rules")
+		}),
+		WithCustomErrorMsg("operator metrics-reader ClusterRole should be created"),
+	)
+
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			roleRef := map[string]any{
+				"apiGroup": "rbac.authorization.k8s.io",
+				"kind":     "ClusterRole",
+				"name":     "odh-observability-metrics-reader",
+			}
+			subjects := []any{
+				map[string]any{
+					"kind":      "ServiceAccount",
+					"name":      "data-science-monitoringstack-prometheus",
+					"namespace": tc.MonitoringNamespace,
+				},
+			}
+			if err := unstructured.SetNestedMap(u.Object, roleRef, "roleRef"); err != nil {
+				return err
+			}
+			return unstructured.SetNestedSlice(u.Object, subjects, "subjects")
+		}),
+		WithCustomErrorMsg("operator metrics-reader ClusterRoleBinding should be created"),
+	)
+
 	t.Logf("created operator ServiceMonitor in namespace %s", operatorNS)
 }
 
