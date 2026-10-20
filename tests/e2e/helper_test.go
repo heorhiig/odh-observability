@@ -1236,7 +1236,7 @@ func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 
 	// Create the ServiceMonitor for operator metrics
 	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitorCoreos, types.NamespacedName{
 			Name:      "odh-observability-metrics",
 			Namespace: operatorNS,
 		}),
