@@ -58,6 +58,9 @@ webhookIngressCIDRs:
   - 10.128.0.0/14  # OpenShift pod network
 
 metrics:
+  # ServiceAccount name that Prometheus uses (created by MonitoringStack).
+  # Granted read access to operator /metrics endpoint via ClusterRoleBinding.
+  prometheusServiceAccount: data-science-monitoringstack-prometheus
   # Enable ServiceMonitor resource creation for Prometheus Operator.
   serviceMonitor:
     # Enable after the RHOBS ServiceMonitor CRD is available.

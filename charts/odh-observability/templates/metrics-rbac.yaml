@@ -8,10 +8,8 @@ rules:
   # Grant permission to GET the /metrics endpoint of the manager pod.
   # The controller-runtime metrics server enforces this via SubjectAccessReview
   # when FilterProvider: WithAuthenticationAndAuthorization is enabled.
-  - nonResourceURLs:
-      - "/metrics"
-    verbs:
-      - "get"
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -28,5 +26,5 @@ subjects:
   # The MonitoringStack controller creates this ServiceAccount with the naming pattern:
   # <monitoringstack-name>-prometheus
   - kind: ServiceAccount
-    name: data-science-monitoringstack-prometheus
+    name: {{ .Values.metrics.prometheusServiceAccount | default "data-science-monitoringstack-prometheus" }}
     namespace: {{ include "odh-observability.monitoringNamespace" . }}
