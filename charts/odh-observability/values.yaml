@@ -60,9 +60,15 @@ env: []
 
 # Metrics configuration
 metrics:
+  # ServiceAccount that Prometheus uses to scrape the operator /metrics endpoint.
+  # Created by the MonitoringStack as <monitoringstack-name>-prometheus; granted
+  # read access to /metrics via the metrics-reader ClusterRoleBinding.
+  prometheusServiceAccount: data-science-monitoringstack-prometheus
   serviceMonitor:
     # Enable operator metrics ServiceMonitor creation.
-    # Requires Cluster Observability Operator (COO) or Prometheus Operator.
-    enabled: true
+    # Keep disabled until the RHOBS ServiceMonitor CRD is available on the cluster;
+    # otherwise `helm install` fails with "no matches for kind ServiceMonitor".
+    # Supported deployments must enable this explicitly to scrape metrics.
+    enabled: false
     # API version for ServiceMonitor (monitoring.rhobs/v1 for COO, monitoring.coreos.com/v1 for upstream)
     apiVersion: monitoring.rhobs/v1
