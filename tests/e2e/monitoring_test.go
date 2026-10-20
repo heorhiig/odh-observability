@@ -1518,6 +1518,21 @@ func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 		)),
 		WithCustomErrorMsg("TempoMonolithic CR should be created by controller when traces are configured"),
 	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      "data-science-tempomonolithic-ingress",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "tempo-monolithic"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "data-science-tempomonolithic"`),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080]`),
+		)),
+		WithCustomErrorMsg("TempoMonolithic NetworkPolicy should expose only the collector, Prometheus, and Perses paths"),
+	)
 }
 
 // ValidateCollectorMLflowIntegrationRBAC tests that the collector SA has the MLflow trace export ClusterRole and ClusterRoleBinding.

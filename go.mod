@@ -8,8 +8,8 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/itchyny/gojq v0.12.19
 	github.com/onsi/gomega v1.42.0
-	github.com/opendatahub-io/odh-platform-utilities v0.4.0
-	github.com/opendatahub-io/odh-platform-utilities/framework v0.0.0-20261006161300-258711fd9c1c
+	github.com/opendatahub-io/odh-platform-utilities v0.5.0
+	github.com/opendatahub-io/odh-platform-utilities/framework v0.2.0
 	github.com/openshift/api v0.0.0-20261002115817-f8795cdde518
 	github.com/openshift/library-go v0.0.0-20261001144932-192662696fc7
 	github.com/stretchr/testify v1.11.1
