@@ -189,4 +189,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "odh-observability.fullname" . }}
-    namespace: {{ include "odh-observability.monitoringNamespace" . }}
+    namespace: {{ .Values.operatorNamespace }}

@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "odh-observability.fullname" . }}-manager
-  namespace: {{ include "odh-observability.monitoringNamespace" . }}
+  namespace: {{ .Values.operatorNamespace }}
   labels:
     {{- include "odh-observability.labels" . | nindent 4 }}
 spec:
