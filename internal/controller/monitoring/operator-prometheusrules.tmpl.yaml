@@ -92,6 +92,8 @@ spec:
 
         - alert: MonitoringWebhookAdmissionErrors
           expr: |
+            # Requires operator metrics ServiceMonitor to be enabled.
+            # If disabled, metric doesn't exist and alert won't fire.
             rate(controller_runtime_webhook_requests_total{
               code="500"
             }[5m]) > 0
@@ -109,10 +111,10 @@ spec:
             # Periodic probe actively tests the webhook admission path by creating/patching
             # a test PodMonitor and verifying the webhook adds the scrape label. This metric
             # records the timestamp of the last successful probe. Alert fires when the probe
-            # hasn't succeeded in 15 minutes (or never succeeded), indicating webhook Service,
-            # TLS cert, MutatingWebhookConfiguration, or endpoint is broken.
-            absent(webhook_admission_probe_last_success_timestamp_seconds)
-            or
+            # hasn't succeeded in 15 minutes, indicating webhook Service, TLS cert,
+            # MutatingWebhookConfiguration, or endpoint is broken.
+            # Requires operator metrics ServiceMonitor to be enabled.
+            # If disabled, metric doesn't exist and alert won't fire.
             (time() - webhook_admission_probe_last_success_timestamp_seconds) > 900
           for: 5m
           labels:

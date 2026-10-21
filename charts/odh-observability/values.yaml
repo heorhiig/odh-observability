@@ -76,6 +76,7 @@ metrics:
     # Disable ONLY on clusters where the ServiceMonitor CRD
     # (monitoring.rhobs/v1 or monitoring.coreos.com/v1) is not yet installed;
     # otherwise `helm install` fails with "no matches for kind ServiceMonitor".
-    enabled: true
+    # E2e tests create this manually after COO is installed.
+    enabled: false
     # API version for ServiceMonitor (monitoring.rhobs/v1 for COO, monitoring.coreos.com/v1 for upstream)
     apiVersion: monitoring.rhobs/v1
