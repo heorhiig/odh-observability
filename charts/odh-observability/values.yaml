@@ -56,6 +56,7 @@ env: []
 webhookIngressCIDRs:
   - 172.30.0.0/16  # OpenShift service network
   - 10.128.0.0/14  # OpenShift pod network
+  - 10.0.0.0/16    # OpenShift machine/host network (kube-apiserver node IPs)
 
 metrics:
   # ServiceAccount name that Prometheus uses (created by MonitoringStack).
