@@ -106,31 +106,19 @@ spec:
 
         - alert: MonitoringWebhookAdmissionPathDown
           expr: |
-            # Black-box check: webhook-health-probe PodMonitor exists but webhook has not
-            # successfully processed any admission requests in 10 minutes. This indicates
-            # webhook Service, TLS cert, MutatingWebhookConfiguration, or endpoint is broken.
-            # NOTE: This is a one-time canary probe, not periodic. It detects initial setup
-            # failures but may not catch later issues (e.g., TLS cert expiry) without new
-            # admission requests.
-            kube_podmonitor_created{
-              namespace="{{ .Namespace }}",
-              podmonitor="webhook-health-probe"
-            }
-            and on()
-            (
-              absent(controller_runtime_webhook_requests_total{
-                code=~"2.."
-              })
-              or
-              increase(controller_runtime_webhook_requests_total{
-                code=~"2.."
-              }[10m]) == 0
-            )
+            # Periodic probe actively tests the webhook admission path by creating/patching
+            # a test PodMonitor and verifying the webhook adds the scrape label. This metric
+            # records the timestamp of the last successful probe. Alert fires when the probe
+            # hasn't succeeded in 15 minutes (or never succeeded), indicating webhook Service,
+            # TLS cert, MutatingWebhookConfiguration, or endpoint is broken.
+            absent(webhook_admission_probe_last_success_timestamp_seconds)
+            or
+            (time() - webhook_admission_probe_last_success_timestamp_seconds) > 900
           for: 5m
           labels:
             severity: critical
             namespace: "{{ .OperatorNamespace }}"
           annotations:
             summary: "Webhook admission path is down"
-            description: "No webhook requests in 10m. Check Service, TLS cert, MutatingWebhookConfiguration. Impact: Ignore=monitors not scraped; Fail=admission blocked."
+            description: "Webhook admission probe has failed for 15+ minutes. Check webhook pod logs, Service, TLS cert, MutatingWebhookConfiguration. Impact: failurePolicy=Ignore (default) admits monitors without scrape label (not scraped); Fail blocks admission."
             triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#monitoring-webhook-admission-path-down"

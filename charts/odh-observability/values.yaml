@@ -66,9 +66,16 @@ metrics:
   prometheusServiceAccount: data-science-monitoringstack-prometheus
   serviceMonitor:
     # Enable operator metrics ServiceMonitor creation.
-    # Keep disabled until the RHOBS ServiceMonitor CRD is available on the cluster;
+    #
+    # This MUST be enabled on supported deployments: the operator /metrics
+    # endpoint is the only source for the webhook health signals, and the
+    # following alerts are silently non-functional without it:
+    #   - MonitoringWebhookAdmissionErrors  (controller_runtime_webhook_requests_total)
+    #   - MonitoringWebhookAdmissionPathDown (webhook_admission_probe_* metrics)
+    #
+    # Disable ONLY on clusters where the ServiceMonitor CRD
+    # (monitoring.rhobs/v1 or monitoring.coreos.com/v1) is not yet installed;
     # otherwise `helm install` fails with "no matches for kind ServiceMonitor".
-    # Supported deployments must enable this explicitly to scrape metrics.
-    enabled: false
+    enabled: true
     # API version for ServiceMonitor (monitoring.rhobs/v1 for COO, monitoring.coreos.com/v1 for upstream)
     apiVersion: monitoring.rhobs/v1

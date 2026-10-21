@@ -164,6 +164,20 @@ func main() {
 			setupLog.Error(err, "Unable to register monitoring webhook")
 			os.Exit(1)
 		}
+
+		monitoringNamespace := os.Getenv("MONITORING_NAMESPACE")
+		if monitoringNamespace == "" {
+			monitoringNamespace = os.Getenv("WATCH_NAMESPACE")
+		}
+		if monitoringNamespace != "" {
+			probe := monwebhook.NewAdmissionProbe(mgr.GetClient(), monitoringNamespace, 5*time.Minute)
+			if err := mgr.Add(probe); err != nil {
+				setupLog.Error(err, "Unable to register webhook admission probe")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Info("Webhook admission probe disabled: MONITORING_NAMESPACE not set")
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
