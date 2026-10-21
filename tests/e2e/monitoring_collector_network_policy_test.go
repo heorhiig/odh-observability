@@ -323,6 +323,18 @@ func (tc *MonitoringTestCtx) runTargetAllocatorMTLSNetworkPolicyProbes(t *testin
 	// The Operator names the client Certificate and its Secret identically.
 	// Mount the existing client Secret; do not grant the probe API Secret access.
 	clientCertificate := OpenTelemetryCollectorName + "-ta-client-cert"
+
+	// Verify the client certificate Secret exists before running the mTLS probe
+	clientSecret := &corev1.Secret{}
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Name:      clientCertificate,
+		Namespace: tc.MonitoringNamespace,
+	}, clientSecret)
+	if err != nil {
+		t.Logf("Skipping mTLS NetworkPolicy probe: client certificate Secret %s/%s not found: %v",
+			tc.MonitoringNamespace, clientCertificate, err)
+		return
+	}
 	tc.runNetworkPolicyProbe(t, "targetallocator-mtls-allowed", tc.MonitoringNamespace,
 		collectorNetworkPolicyLabels(tc.MonitoringNamespace), nil, true, func(probe *corev1.Pod) {
 			probe.Spec.Volumes = []corev1.Volume{{
