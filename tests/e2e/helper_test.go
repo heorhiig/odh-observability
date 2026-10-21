@@ -968,11 +968,11 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		tc.ensureCRDExists(t, required)
 	}
 
-	// After the COO ServiceMonitor CRD is confirmed above (both modes), create the
-	// operator's metrics-ca ConfigMap and ServiceMonitor. These are what the operator
-	// metrics auth tests depend on; skipping them in DSC mode left the ConfigMap absent
-	// and failed those tests immediately.
-	tc.ensureOperatorServiceMonitor(t)
+	// After the COO ServiceMonitor CRD is confirmed above, create the
+	// operator's metrics-ca ConfigMap and ServiceMonitor in Module mode only.
+	if tc.ApiMode == APIModeModule {
+		tc.ensureOperatorServiceMonitor(t)
+	}
 
 	tc.ensureMonitoringCRExists(t)
 
