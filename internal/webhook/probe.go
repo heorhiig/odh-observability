@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,6 +31,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+)
+
+const (
+	probeAPIGroup = "monitoring.rhobs"
+	probeKind     = "PodMonitor"
 )
 
 var (
@@ -78,7 +84,6 @@ func NewAdmissionProbe(client client.Client, namespace string, interval time.Dur
 	}
 }
 
-
 // Start implements manager.Runnable.
 func (p *AdmissionProbe) Start(ctx context.Context) error {
 	p.log.Info("starting webhook admission probe", "interval", p.interval, "namespace", p.namespace)
@@ -108,22 +113,22 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 
 	probePodMonitor := &unstructured.Unstructured{}
 	probePodMonitor.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "monitoring.rhobs",
+		Group:   probeAPIGroup,
 		Version: "v1",
-		Kind:    "PodMonitor",
+		Kind:    probeKind,
 	})
 	probePodMonitor.SetNamespace(p.namespace)
 	probePodMonitor.SetName("webhook-admission-probe")
 
 	// Set spec to a minimal valid PodMonitor (webhook only cares about labels, not spec)
-	spec := map[string]interface{}{
-		"selector": map[string]interface{}{
-			"matchLabels": map[string]interface{}{
+	spec := map[string]any{
+		"selector": map[string]any{
+			"matchLabels": map[string]any{
 				"app": "webhook-probe-nonexistent",
 			},
 		},
-		"podMetricsEndpoints": []interface{}{
-			map[string]interface{}{
+		"podMetricsEndpoints": []any{
+			map[string]any{
 				"port":     "metrics",
 				"interval": "30s",
 			},
@@ -205,7 +210,7 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 				lastErr = nil
 				break
 			}
-			lastErr = fmt.Errorf("webhook did not add the scrape label")
+			lastErr = errors.New("webhook did not add the scrape label")
 
 			// Nudge admission again (UPDATE is covered by the webhook rules).
 			current.SetAnnotations(mergeAnnotation(current.GetAnnotations(), "probe-retry-at", time.Now().Format(time.RFC3339Nano)))
