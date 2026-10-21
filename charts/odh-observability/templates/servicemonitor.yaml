@@ -30,11 +30,11 @@ spec:
           configMap:
             name: {{ include "odh-observability.fullname" . }}-metrics-ca
             key: service-ca.crt
-        serverName: {{ include "odh-observability.fullname" . }}-metrics.{{ .Values.operatorNamespace }}.svc
+        serverName: {{ include "odh-observability.fullname" . }}-metrics.{{ include "odh-observability.monitoringNamespace" . }}.svc
   selector:
     matchLabels:
       {{- include "odh-observability.selectorLabels" . | nindent 6 }}
   namespaceSelector:
     matchNames:
-      - {{ .Values.operatorNamespace }}
+      - {{ include "odh-observability.monitoringNamespace" . }}
 {{- end }}

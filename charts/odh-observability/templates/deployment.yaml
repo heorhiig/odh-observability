@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "odh-observability.fullname" . }}
-  namespace: {{ .Values.operatorNamespace }}
+  namespace: {{ include "odh-observability.monitoringNamespace" . }}
   labels:
     {{- include "odh-observability.labels" . | nindent 4 }}
 spec:

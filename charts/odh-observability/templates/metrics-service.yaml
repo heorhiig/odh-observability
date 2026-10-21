@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "odh-observability.fullname" . }}-metrics
-  namespace: {{ .Values.operatorNamespace }}
+  namespace: {{ include "odh-observability.monitoringNamespace" . }}
   labels:
     {{- include "odh-observability.labels" . | nindent 4 }}
   annotations:
