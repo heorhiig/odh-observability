@@ -483,11 +483,21 @@ func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T) {
 
 	tc.deleteFixtureResources(otlpIdentitySpoofPodName)
 	t.Cleanup(func() { tc.deleteFixtureResources(otlpIdentitySpoofPodName) })
+
+	// The collector NetworkPolicy only admits OTLP from instrumented
+	// llminferenceservice workloads in namespaces enrolled with
+	// monitoring.opendatahub.io/otlp=true. Emulate that sender so the push
+	// reaches the collector and the identity-spoofing checks can run.
+	tc.enrollNamespaceForOTLP(t, tc.MonitoringNamespace)
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      otlpIdentitySpoofPodName,
 			Namespace: tc.MonitoringNamespace,
-			Labels:    map[string]string{"app": otlpIdentitySpoofPodName},
+			Labels: map[string]string{
+				"app":                         otlpIdentitySpoofPodName,
+				"app.kubernetes.io/part-of":   "llminferenceservice",
+				"app.kubernetes.io/component": "llminferenceservice-workload",
+			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
@@ -501,6 +511,40 @@ func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T) {
 				SecurityContext: fixtureContainerSecurityContext(),
 			}},
 		},
+	})
+}
+
+// enrollNamespaceForOTLP labels the namespace with
+// monitoring.opendatahub.io/otlp=true so OTLP senders in it are admitted by the
+// collector NetworkPolicy, restoring the prior label state on cleanup.
+func (tc *MonitoringTestCtx) enrollNamespaceForOTLP(t *testing.T, name string) {
+	t.Helper()
+
+	namespace := &corev1.Namespace{}
+	require.NoError(t, tc.Client().Get(tc.Context(), types.NamespacedName{Name: name}, namespace))
+	if namespace.Labels[otlpNamespaceLabel] == "true" {
+		return
+	}
+	previous, had := namespace.Labels[otlpNamespaceLabel]
+	if namespace.Labels == nil {
+		namespace.Labels = map[string]string{}
+	}
+	namespace.Labels[otlpNamespaceLabel] = "true"
+	require.NoError(t, tc.Client().Update(tc.Context(), namespace))
+	t.Cleanup(func() {
+		restore := &corev1.Namespace{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: name}, restore); err != nil {
+			t.Logf("failed to get namespace %s for OTLP label cleanup: %v", name, err)
+			return
+		}
+		if had {
+			restore.Labels[otlpNamespaceLabel] = previous
+		} else {
+			delete(restore.Labels, otlpNamespaceLabel)
+		}
+		if err := tc.Client().Update(tc.Context(), restore); err != nil {
+			t.Logf("failed to restore OTLP label on namespace %s: %v", name, err)
+		}
 	})
 }
 
