@@ -1200,13 +1200,20 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 	t.Helper()
 
-	// Resolve the namespace the same way the auth test does (via the operator's
-	// MONITORING_NAMESPACE), so the CA ConfigMap and ServiceMonitor are created in the
-	// exact namespace probeOperatorMetrics reads them from. Using the operator
-	// Deployment's own namespace instead left them in the wrong namespace in DSC mode,
-	// where the operator and monitoring namespaces differ, so the auth tests could not
-	// find the CA ConfigMap.
-	operatorNS := tc.ensureOperatorDeploymentReady(t)
+	// Get the operator deployment to find its namespace
+	deployments := &unstructured.UnstructuredList{}
+	deployments.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "DeploymentList",
+	})
+	if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+		t.Fatalf("failed to list odh-observability Deployment: %v", err)
+	}
+	if len(deployments.Items) == 0 {
+		t.Fatalf("odh-observability Deployment not found")
+	}
+	operatorNS := deployments.Items[0].GetNamespace()
 
 	// Create the CA ConfigMap for service-ca injection
 	tc.EventuallyResourceCreatedOrPatched(
