@@ -330,11 +330,12 @@ func (tc *MonitoringTestCtx) runTargetAllocatorMTLSNetworkPolicyProbes(t *testin
 		Name:      clientCertificate,
 		Namespace: tc.MonitoringNamespace,
 	}, clientSecret)
-	if err != nil {
-		t.Logf("Skipping mTLS NetworkPolicy probe: client certificate Secret %s/%s not found: %v",
-			tc.MonitoringNamespace, clientCertificate, err)
+	if errors.IsNotFound(err) {
+		t.Logf("Skipping mTLS NetworkPolicy probe: client certificate Secret %s/%s not found",
+			tc.MonitoringNamespace, clientCertificate)
 		return
 	}
+	require.NoError(t, err, "failed to get client certificate Secret %s/%s", tc.MonitoringNamespace, clientCertificate)
 	tc.runNetworkPolicyProbe(t, "targetallocator-mtls-allowed", tc.MonitoringNamespace,
 		collectorNetworkPolicyLabels(tc.MonitoringNamespace), nil, true, func(probe *corev1.Pod) {
 			probe.Spec.Volumes = []corev1.Volume{{
