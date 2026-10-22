@@ -181,7 +181,7 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 	// Run an inference-labeled probe from the enrolled namespace. Keep it
 	// alive for warm-up and repeated attack submissions.
 	tc.createOTLPIdentityProbe(t, otlpIdentityProbeNamespace)
-	probe := tc.readyOTLPIdentityProbe(t, otlpIdentityProbeNamespace)
+	probe := tc.readyOTLPIdentityProbe(t)
 	sender = podIdentity(probe)
 	require.NotEmpty(t, sender.IP, "OTLP identity probe must have a pod IP")
 
@@ -539,40 +539,6 @@ func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T, namespace str
 	})
 }
 
-// enrollNamespaceForOTLP labels the namespace with
-// monitoring.opendatahub.io/otlp=true so OTLP senders in it are admitted by the
-// collector NetworkPolicy, restoring the prior label state on cleanup.
-func (tc *MonitoringTestCtx) enrollNamespaceForOTLP(t *testing.T, name string) {
-	t.Helper()
-
-	namespace := &corev1.Namespace{}
-	require.NoError(t, tc.Client().Get(tc.Context(), types.NamespacedName{Name: name}, namespace))
-	if namespace.Labels[otlpNamespaceLabel] == "true" {
-		return
-	}
-	previous, had := namespace.Labels[otlpNamespaceLabel]
-	if namespace.Labels == nil {
-		namespace.Labels = map[string]string{}
-	}
-	namespace.Labels[otlpNamespaceLabel] = "true"
-	require.NoError(t, tc.Client().Update(tc.Context(), namespace))
-	t.Cleanup(func() {
-		restore := &corev1.Namespace{}
-		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: name}, restore); err != nil {
-			t.Logf("failed to get namespace %s for OTLP label cleanup: %v", name, err)
-			return
-		}
-		if had {
-			restore.Labels[otlpNamespaceLabel] = previous
-		} else {
-			delete(restore.Labels, otlpNamespaceLabel)
-		}
-		if err := tc.Client().Update(tc.Context(), restore); err != nil {
-			t.Logf("failed to restore OTLP label on namespace %s: %v", name, err)
-		}
-	})
-}
-
 func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T) corev1.Pod {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -580,7 +546,7 @@ func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T) corev1.Pod {
 	var probe corev1.Pod
 	tc.g.Eventually(func() error {
 		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
-			Name: otlpIdentitySpoofPodName, Namespace: namespace,
+			Name: otlpIdentitySpoofPodName, Namespace: otlpIdentityProbeNamespace,
 		}, &probe); err != nil {
 			return err
 		}
