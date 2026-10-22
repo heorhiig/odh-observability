@@ -254,6 +254,11 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testi
 		),
 		WithCustomErrorMsg("prometheus-web-tls-ca ConfigMap should exist with CA injection annotation"),
 	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: "prometheus-web-tls-ca", Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.data."service-ca.crt" != null`)),
+		WithCustomErrorMsg("prometheus-web-tls-ca Secret should contain the injected service CA"),
+	)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: "prometheus-operated", Namespace: tc.MonitoringNamespace}),
