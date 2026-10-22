@@ -547,25 +547,6 @@ func TestDeployOperatorMonitoring_CRDPresent(t *testing.T) {
 	}
 }
 
-func TestDeployWebhookHealthProbe_CRDPresent(t *testing.T) {
-	s := newActionsTestScheme(t)
-	registerCRDs(s, gvk.PodMonitor)
-
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	cm := conditions.NewConditionsManager(m, m.Generation)
-	var sources []rendertemplate.TemplateSource
-
-	err := deployWebhookHealthProbe(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(sources) != 1 {
-		t.Errorf("expected 1 source for webhook health probe, got %d", len(sources))
-	}
-}
-
 // --- deployNodeMetricsEndpoint ---
 
 func TestDeployNodeMetricsEndpoint_NoMetrics(t *testing.T) {

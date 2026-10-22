@@ -22,18 +22,21 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
-// --- helpers -----------------------------------------------------------------
+const probeTestNamespace = "probe-ns"
 
-func probeGVK() schema.GroupVersionKind {
-	return schema.GroupVersionKind{Group: probeAPIGroup, Version: "v1", Kind: probeKind}
-}
+var enrolledNamespaceLabels = map[string]string{labelMonitoring: "true"}
+
+// --- helpers -----------------------------------------------------------------
 
 // gaugeValue reads the current float64 value of a prometheus.Gauge/Counter via
 // the dto.Metric Write method so we don't import the internal registry directly.
@@ -56,10 +59,74 @@ func gaugeValue(t *testing.T, g interface {
 
 // newTestProbe returns an AdmissionProbe whose retryTimeout is short so failure
 // tests don't take 10 seconds.
-func newTestProbe(c client.Client, namespace string) *AdmissionProbe {
-	p := NewAdmissionProbe(c, namespace, time.Minute)
+func newTestProbe(c client.Client) *AdmissionProbe {
+	p := NewAdmissionProbe(c, probeTestNamespace, time.Minute)
 	p.retryTimeout = 200 * time.Millisecond
 	return p
+}
+
+// selectorAwareWebhookClient returns a fake client that injects the scrape label
+// the way the API server dispatches to the mutating webhook configured in
+// charts/odh-observability/templates/webhook.yaml: only when the object's
+// namespace is labeled monitoring.opendatahub.io/scrape=true (namespaceSelector)
+// and the incoming object does not already carry the label (objectSelector).
+func selectorAwareWebhookClient( //nolint:ireturn // test helper; concrete type not exported by controller-runtime/fake
+	t *testing.T,
+	namespaceLabels map[string]string,
+	objs ...client.Object,
+) client.Client {
+	t.Helper()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: probeTestNamespace, Labels: namespaceLabels}}
+
+	admit := func(ctx context.Context, c client.WithWatch, obj client.Object) error {
+		if _, ok := obj.GetLabels()[labelMonitoring]; ok {
+			return nil
+		}
+		namespace := &corev1.Namespace{}
+		if err := c.Get(ctx, client.ObjectKey{Name: obj.GetNamespace()}, namespace); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if namespace.Labels[labelMonitoring] != "true" {
+			return nil
+		}
+		labels := obj.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels[labelMonitoring] = "true"
+		obj.SetLabels(labels)
+		return nil
+	}
+
+	return fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(append([]client.Object{ns}, objs...)...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if err := admit(ctx, c, obj); err != nil {
+					return err
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if err := admit(ctx, c, obj); err != nil {
+					return err
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+}
+
+func storedProbeLabels(t *testing.T, c client.Client) map[string]string {
+	t.Helper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk.PodMonitor)
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: probeTestNamespace, Name: probeObjectName}, obj); err != nil {
+		t.Fatalf("reading probe PodMonitor: %v", err)
+	}
+	return obj.GetLabels()
 }
 
 // --- mergeAnnotation ---------------------------------------------------------
@@ -90,123 +157,96 @@ func TestMergeAnnotation_Overwrite(t *testing.T) {
 	}
 }
 
-// --- runProbe: success path --------------------------------------------------
+// --- runProbe ----------------------------------------------------------------
 
-// simulatingWebhook wraps a fake client and adds monitoring.opendatahub.io/scrape=true
-// on every Create/Update, mimicking what the mutating webhook does on the real API server.
-func webhookMutatingClient(t *testing.T) client.Client { //nolint:ireturn // test helper; concrete type not exported by controller-runtime/fake
-	t.Helper()
-	s := newTestScheme()
-	// Register the probe GVK so the fake client can store it (newTestScheme already
-	// registers the RHOBS PodMonitor GVK used by the probe, but register explicitly
-	// in case newTestScheme ever changes).
-	s.AddKnownTypeWithName(probeGVK(), &unstructured.Unstructured{})
-	s.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: probeAPIGroup, Version: "v1", Kind: probeKind + "List"},
-		&unstructured.UnstructuredList{},
-	)
-
-	addScrapeLabel := func(obj client.Object) {
-		labels := obj.GetLabels()
-		if labels == nil {
-			labels = map[string]string{}
-		}
-		labels["monitoring.opendatahub.io/scrape"] = "true"
-		obj.SetLabels(labels)
-	}
-
-	return fake.NewClientBuilder().
-		WithScheme(s).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-				addScrapeLabel(obj)
-				return c.Create(ctx, obj, opts...)
-			},
-			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				addScrapeLabel(obj)
-				return c.Update(ctx, obj, opts...)
-			},
-		}).
-		Build()
-}
-
-func TestRunProbe_WebhookMutates_FirstCreate(t *testing.T) {
-	c := webhookMutatingClient(t)
-	p := newTestProbe(c, "test-ns")
+func TestRunProbe_EnrolledNamespace_Create(t *testing.T) {
+	c := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+	p := newTestProbe(c)
 
 	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-
 	p.runProbe(context.Background())
 
-	afterFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	if afterFailures != beforeFailures {
-		t.Errorf("expected no new failures, got %v new failures", afterFailures-beforeFailures)
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
+		t.Errorf("expected no new failures, got %v", got)
 	}
-
-	// Success timestamp should be non-zero.
-	ts := gaugeValue(t, webhookProbeLastSuccessTimestamp)
-	if ts == 0 {
+	if gaugeValue(t, webhookProbeLastSuccessTimestamp) == 0 {
 		t.Error("expected non-zero last success timestamp after successful probe")
 	}
-}
-
-func TestRunProbe_WebhookMutates_SubsequentUpdate(t *testing.T) {
-	c := webhookMutatingClient(t)
-	p := newTestProbe(c, "test-ns")
-
-	// First run creates the probe PodMonitor.
-	p.runProbe(context.Background())
-
-	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-
-	// Second run updates it (exercises the Update branch of runProbe).
-	p.runProbe(context.Background())
-
-	afterFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	if afterFailures != beforeFailures {
-		t.Errorf("expected no new failures on second run, got %v new failures", afterFailures-beforeFailures)
+	if got := storedProbeLabels(t, c)[labelMonitoring]; got != "true" {
+		t.Errorf("expected stored canary to carry %s=true, got %q", labelMonitoring, got)
 	}
 }
 
-// --- runProbe: failure path --------------------------------------------------
+func TestRunProbe_EnrolledNamespace_Update(t *testing.T) {
+	c := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+	p := newTestProbe(c)
 
-// noMutationClient returns a plain fake client that stores objects as-is (no webhook simulation).
-func noMutationClient(t *testing.T) client.Client { //nolint:ireturn // test helper; concrete type not exported by controller-runtime/fake
-	t.Helper()
-	s := newTestScheme()
-	s.AddKnownTypeWithName(probeGVK(), &unstructured.Unstructured{})
-	s.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: probeAPIGroup, Version: "v1", Kind: probeKind + "List"},
-		&unstructured.UnstructuredList{},
-	)
-	return fake.NewClientBuilder().WithScheme(s).Build() //nolint:wrapcheck
-}
-
-func TestRunProbe_WebhookDoesNotMutate(t *testing.T) {
-	c := noMutationClient(t)
-	p := newTestProbe(c, "test-ns")
-
+	// First run creates the canary; the second exercises the Update branch, where
+	// the probe must strip the label so the objectSelector lets the webhook run again.
+	p.runProbe(context.Background())
 	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-
 	p.runProbe(context.Background())
 
-	afterFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	if afterFailures == beforeFailures {
-		t.Error("expected at least one failure when webhook does not mutate, got none")
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
+		t.Errorf("expected no new failures on second run, got %v", got)
+	}
+}
+
+func TestRunProbe_UnenrolledNamespace(t *testing.T) {
+	tests := []struct {
+		name            string
+		namespaceLabels map[string]string
+	}{
+		{name: "no scrape label", namespaceLabels: nil},
+		{name: "scrape label not true", namespaceLabels: map[string]string{labelMonitoring: "false"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := selectorAwareWebhookClient(t, tt.namespaceLabels)
+			p := newTestProbe(c)
+
+			beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+			p.runProbe(context.Background())
+
+			if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
+				t.Errorf("expected exactly one new failure for unenrolled namespace, got %v", got)
+			}
+			if _, ok := storedProbeLabels(t, c)[labelMonitoring]; ok {
+				t.Errorf("webhook must not mutate objects in an unenrolled namespace")
+			}
+		})
+	}
+}
+
+func TestRunProbe_ExistingCanaryWithStaleLabel(t *testing.T) {
+	// A canary left with scrape=false would be skipped by the objectSelector
+	// forever unless the probe removes the label before re-admission.
+	stale := newPodMonitor(probeTestNamespace, probeObjectName, map[string]string{labelMonitoring: "false"})
+	c := selectorAwareWebhookClient(t, enrolledNamespaceLabels, stale)
+	p := newTestProbe(c)
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background())
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
+		t.Errorf("expected no new failures, got %v", got)
+	}
+	if got := storedProbeLabels(t, c)[labelMonitoring]; got != "true" {
+		t.Errorf("expected stale canary to be re-labeled %s=true, got %q", labelMonitoring, got)
 	}
 }
 
 // --- Start: context cancellation --------------------------------------------
 
 func TestStart_ContextCancellation(t *testing.T) {
-	c := webhookMutatingClient(t)
-	p := NewAdmissionProbe(c, "test-ns", 100*time.Millisecond)
+	c := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+	p := NewAdmissionProbe(c, probeTestNamespace, 100*time.Millisecond)
 	p.retryTimeout = 50 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
-	// Start should return promptly after the context is cancelled.
 	done := make(chan error, 1)
 	go func() { done <- p.Start(ctx) }()
 

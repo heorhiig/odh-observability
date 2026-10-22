@@ -80,7 +80,6 @@ const (
 	TempoServiceCAConfigMapTemplate                  = "resources/tempo-service-ca-configmap.tmpl.yaml"
 	PersesOperatorAccessNetworkPolicyTemplate        = "resources/perses-operator-access-network-policy.tmpl.yaml"
 	OperatorPrometheusRulesTemplate                  = "monitoring/operator-prometheusrules.tmpl.yaml"
-	WebhookHealthProbeTemplate                       = "resources/webhook-health-probe.tmpl.yaml"
 	AcceleratorRecordingRulesTemplate                = "resources/accelerator-recording-rules.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorTemplate          = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
@@ -837,25 +836,6 @@ func deployWebhookInfrastructure(
 	}
 
 	cm.MarkTrue(conditions.ConditionWebhookAvailable)
-	return nil
-}
-
-func deployWebhookHealthProbe(
-	ctx context.Context,
-	c client.Client,
-	_ *v1alpha1.Monitoring,
-	_ *conditions.ConditionsManager,
-	sources *[]rendertemplate.TemplateSource,
-) error {
-	exists, err := hasCRD(ctx, c, gvk.PodMonitor)
-	if err != nil {
-		return fmt.Errorf("checking PodMonitor CRD: %w", err)
-	}
-	if !exists {
-		return nil
-	}
-
-	*sources = append(*sources, src(WebhookHealthProbeTemplate))
 	return nil
 }
 

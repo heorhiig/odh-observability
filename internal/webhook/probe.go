@@ -34,8 +34,9 @@ import (
 )
 
 const (
-	probeAPIGroup = "monitoring.rhobs"
-	probeKind     = "PodMonitor"
+	probeAPIGroup   = "monitoring.rhobs"
+	probeKind       = "PodMonitor"
+	probeObjectName = "webhook-admission-probe"
 )
 
 var (
@@ -120,7 +121,7 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 		Kind:    probeKind,
 	})
 	probePodMonitor.SetNamespace(p.namespace)
-	probePodMonitor.SetName("webhook-admission-probe")
+	probePodMonitor.SetName(probeObjectName)
 
 	// Set spec to a minimal valid PodMonitor (webhook only cares about labels, not spec)
 	spec := map[string]any{
@@ -153,7 +154,7 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 	})
 
 	// Create or update the probe PodMonitor
-	key := types.NamespacedName{Namespace: p.namespace, Name: "webhook-admission-probe"}
+	key := types.NamespacedName{Namespace: p.namespace, Name: probeObjectName}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(probePodMonitor.GroupVersionKind())
 
