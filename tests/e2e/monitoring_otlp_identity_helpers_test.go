@@ -134,9 +134,9 @@ func TestOTLPSeriesIdentityChecks(t *testing.T) {
 	}
 }
 
-func TestOTLPDeliveryRequiresAcceptedPushAndMonitoringSeries(t *testing.T) {
+func TestOTLPDeliveryRequiresAcceptedPushAndSenderSeries(t *testing.T) {
 	snapshot := otlpIdentitySnapshot{
-		monitoring: otlpQueryObservation{
+		sender: otlpQueryObservation{
 			status: http.StatusOK,
 			series: []map[string]string{{"__name__": "odh_identity_probe"}},
 		},
@@ -155,7 +155,7 @@ func TestOTLPDeliveryRequiresAcceptedPushAndMonitoringSeries(t *testing.T) {
 		require.Error(t, otlpDeliveryError(evidence))
 	})
 	t.Run("non-success query is not delivery", func(t *testing.T) {
-		failed := otlpIdentitySnapshot{monitoring: otlpQueryObservation{status: http.StatusForbidden}}
+		failed := otlpIdentitySnapshot{sender: otlpQueryObservation{status: http.StatusForbidden}}
 		evidence := &otlpIdentityEvidence{acceptedPushes: 1, snapshots: []otlpIdentitySnapshot{failed}}
 		require.Error(t, otlpDeliveryError(evidence))
 	})

@@ -328,8 +328,8 @@ func (tc *MonitoringTestCtx) runTargetAllocatorMTLSNetworkPolicyProbes(t *testin
 for resource in jobs scrape_configs; do
   status=$(curl --noproxy '*' -sS --cacert /tls/ca.crt --cert /tls/tls.crt --key /tls/tls.key \
     --connect-timeout 5 --max-time 15 -o /dev/null -w '%%{http_code}' %q/"$resource")
-  test "$status" = 200
   printf 'authenticated %%s: %%s\n' "$resource" "$status"
+  test "$status" = 200
 done
 # A reachable TLS listener must reject a client without its certificate.
 set +e
@@ -337,9 +337,12 @@ connection=$(curl --noproxy '*' -sS --cacert /tls/ca.crt \
   --connect-timeout 5 --max-time 15 -o /dev/null -w '%%{num_connects}:%%{http_code}' %q/jobs)
 result=$?
 set -e
+printf 'missing client certificate: connection=%%s curl=%%s\n' "$connection" "$result"
 test "$connection" = 1:000
-test "$result" -eq 35 -o "$result" -eq 56
-printf 'missing client certificate rejected: curl=%%s\n' "$result"
+# Curl/OpenSSL versions report an mTLS rejection as 16 (SSL_write broken
+# pipe), 35 (TLS connect), or 56 (recv failure). In each case the TCP
+# connection succeeded but the server returned no HTTP response.
+test "$result" -eq 16 -o "$result" -eq 35 -o "$result" -eq 56
 `, endpoint, endpoint)}
 		})
 	tc.runNetworkPolicyProbe(t, "targetallocator-mtls-untrusted-denied", tc.MonitoringNamespace,
@@ -389,6 +392,13 @@ func (tc *MonitoringTestCtx) runNetworkPolicyProbe(
 		case corev1.PodSucceeded:
 			return nil
 		case corev1.PodFailed:
+			for _, status := range current.Status.ContainerStatuses {
+				if status.State.Terminated != nil {
+					return StopErr(fmt.Errorf("pod phase is %s, container %s exited %d: %s",
+						current.Status.Phase, status.Name, status.State.Terminated.ExitCode,
+						status.State.Terminated.Message), "NetworkPolicy probe %s failed", probeName)
+				}
+			}
 			return StopErr(fmt.Errorf("pod phase is %s", current.Status.Phase), "NetworkPolicy probe %s failed", probeName)
 		default:
 			return fmt.Errorf("NetworkPolicy probe %s is %s", probeName, current.Status.Phase)

@@ -181,18 +181,20 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return result, reconcileErr
 }
 
-func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (ctrl.Result, error) {
+//nolint:nonamedreturns // The deferred status update needs the error from every return path.
+func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (result ctrl.Result, reconcileErr error) {
 	log := logf.FromContext(ctx)
 	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
-
-	platformVersion, err := r.readPlatformVersion(ctx)
-	if err != nil {
-		log.Error(err, "Failed to read platform version from ConfigMap", "name", platformConfigName)
-		return ctrl.Result{}, err
-	}
+	var platformVersion string
 	stampPlatform := false
 
 	defer func() {
+		if reconcileErr != nil {
+			message := reconcileErr.Error()
+			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ReconcileFailed", message)
+			cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "ReconcileFailed", message)
+			cm.MarkTrue(string(platformcommon.ConditionTypeDegraded))
+		}
 		monitoring.Status.ObservedGeneration = monitoring.Generation
 		monitoring.Status.Phase = cm.Phase()
 		// Upsert the module identity without replacing the whole releases
@@ -208,6 +210,13 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 			monitoring.GetReleaseStatus().SetPlatformRelease(platformVersion)
 		}
 	}()
+
+	var err error
+	platformVersion, err = r.readPlatformVersion(ctx)
+	if err != nil {
+		log.Error(err, "Failed to read platform version from ConfigMap", "name", platformConfigName)
+		return ctrl.Result{}, err
+	}
 
 	// Handle Removed state.
 	if monitoring.Spec.ManagementState == platformcommon.Removed {
@@ -269,41 +278,23 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{}, nil
 	}
 
-	// Run non-Perses action functions to collect template sources.
-	var sources []rendertemplate.TemplateSource
-	for _, action := range []func(context.Context, client.Client, *v1alpha1.Monitoring, *conditions.ConditionsManager, *[]rendertemplate.TemplateSource) error{
-		deployWebhookInfrastructure,
-		deployMonitoringAdmissionPolicies,
-		deployMonitoringStackWithQuerierAndRestrictions,
-		deployTracingStack,
-		deployOpenTelemetryCollector,
-		deployUsageLogsCollector,
-		deployLokiStack,
-		deployAlerting,
-		deployNodeMetricsEndpoint,
-		deployClusterLogForwarder,
-		deployKorrel8r,
-	} {
-		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Perses actions share the pre-resolved API version.
-	if err := deployPerses(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := deployPersesTempoIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := deployPersesPrometheusIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Render all template sources.
-	desired, err := rendertemplate.Render(ctx, r.Scheme, sources, data)
+	desired, err := r.renderMonitoringResources(ctx, monitoring, cm, data, persesVersion, persesFound)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("rendering templates: %w", err)
+		return ctrl.Result{}, err
+	}
+
+	// The OpenShift service-ca operator fills the injected ConfigMap
+	// asynchronously. Apply that ConfigMap first and copy its CA into the
+	// Secret before allowing MonitoringStack to create Prometheus pods.
+	caReady, err := r.preparePrometheusWebTLSCA(ctx, monitoring, desired)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("preparing Prometheus web TLS CA: %w", err)
+	}
+	deployResources := desired
+	if !caReady {
+		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
+			"PrometheusCAUnavailable", "Waiting for OpenShift service CA injection and Prometheus CA Secret")
+		deployResources = withoutMonitoringStack(desired)
 	}
 
 	// Apply desired resources via the deploy library (SSA with caching).
@@ -311,7 +302,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		Client:    r.Client,
 		Owner:     monitoring,
 		Release:   deploy.ReleaseInfo{Type: platformType, Version: operatorVersion()},
-		Resources: desired,
+		Resources: deployResources,
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("applying resources: %w", err)
 	}
@@ -352,7 +343,13 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// desired state without returning an error. Early exits (Removed,
 	// preconditions, configuration errors) and error returns leave the
 	// previous handshake value untouched.
-	stampPlatform = true
+	stampPlatform = caReady
+
+	if !caReady {
+		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded),
+			"PrometheusCAUnavailable", "Waiting for Prometheus CA Secret before applying MonitoringStack")
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
 
 	if requeueNeeded {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -427,6 +424,94 @@ func isOpenTelemetryOperatorNetworkPolicyEvent(obj client.Object) bool {
 	}
 }
 
+func (r *MonitoringReconciler) renderMonitoringResources(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	data map[string]any,
+	persesVersion string,
+	persesFound bool,
+) ([]unstructured.Unstructured, error) {
+	var sources []rendertemplate.TemplateSource
+	for _, action := range []func(context.Context, client.Client, *v1alpha1.Monitoring, *conditions.ConditionsManager, *[]rendertemplate.TemplateSource) error{
+		deployWebhookInfrastructure,
+		deployMonitoringAdmissionPolicies,
+		deployMonitoringStackWithQuerierAndRestrictions,
+		deployTracingStack,
+		deployOpenTelemetryCollector,
+		deployUsageLogsCollector,
+		deployLokiStack,
+		deployAlerting,
+		deployNodeMetricsEndpoint,
+		deployClusterLogForwarder,
+		deployKorrel8r,
+	} {
+		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
+			return nil, err
+		}
+	}
+
+	// Perses actions share the pre-resolved API version.
+	if err := deployPerses(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
+		return nil, err
+	}
+	if err := deployPersesTempoIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
+		return nil, err
+	}
+	if err := deployPersesPrometheusIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
+		return nil, err
+	}
+
+	desired, err := rendertemplate.Render(ctx, r.Scheme, sources, data)
+	if err != nil {
+		return nil, fmt.Errorf("rendering templates: %w", err)
+	}
+	return desired, nil
+}
+
+func (r *MonitoringReconciler) preparePrometheusWebTLSCA(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	desired []unstructured.Unstructured,
+) (bool, error) {
+	stackFound := false
+	var caConfigMap *unstructured.Unstructured
+	for i := range desired {
+		obj := &desired[i]
+		if obj.GroupVersionKind() == controllergvk.MonitoringStack && obj.GetNamespace() == monitoring.Spec.Namespace {
+			stackFound = true
+		}
+		if obj.GroupVersionKind() == controllergvk.ConfigMap && obj.GetNamespace() == monitoring.Spec.Namespace && obj.GetName() == prometheusWebTLSCAConfigMapName {
+			caConfigMap = obj
+		}
+	}
+	if !stackFound {
+		return true, nil
+	}
+	if caConfigMap == nil {
+		return false, errors.New("MonitoringStack requires the Prometheus CA ConfigMap template")
+	}
+	if err := r.Deployer.Deploy(ctx, deploy.DeployInput{
+		Client:    r.Client,
+		Owner:     monitoring,
+		Release:   deploy.ReleaseInfo{Type: platformType, Version: operatorVersion()},
+		Resources: []unstructured.Unstructured{*caConfigMap},
+	}); err != nil {
+		return false, fmt.Errorf("applying Prometheus CA ConfigMap: %w", err)
+	}
+	return syncPrometheusWebTLSCA(ctx, r.Client, monitoring)
+}
+
+func withoutMonitoringStack(desired []unstructured.Unstructured) []unstructured.Unstructured {
+	filtered := make([]unstructured.Unstructured, 0, len(desired))
+	for _, obj := range desired {
+		if obj.GroupVersionKind() != controllergvk.MonitoringStack {
+			filtered = append(filtered, obj)
+		}
+	}
+	return filtered
+}
+
 func (r *MonitoringReconciler) syncPostDeployResources(
 	ctx context.Context,
 	monitoring *v1alpha1.Monitoring,
@@ -434,13 +519,6 @@ func (r *MonitoringReconciler) syncPostDeployResources(
 ) {
 	log := logf.FromContext(ctx)
 
-	// Sync Prometheus CA ConfigMap → Secret (workaround for COO-1270).
-	if err := syncPrometheusWebTLSCA(ctx, r.Client, monitoring); err != nil {
-		log.Error(err, "Failed to sync Prometheus web TLS CA")
-		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
-			"PrometheusCAConfigSyncFailed",
-			fmt.Sprintf("Failed to sync Prometheus web TLS CA: %v", err))
-	}
 	if err := syncThanosQuerierRouteDestinationCA(ctx, r.Client, monitoring); err != nil {
 		log.Error(err, "Failed to sync Thanos Querier Route destination CA")
 		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
@@ -667,6 +745,11 @@ func isPlatformConfigMap(obj client.Object) bool {
 	return obj.GetName() == platformConfigName && obj.GetNamespace() == ns
 }
 
+func isPrometheusWebTLSCASecret(obj client.Object) bool {
+	return obj.GetName() == prometheusWebTLSCAConfigMapName &&
+		obj.GetNamespace() == getEnvOrDefault("MONITORING_NAMESPACE", defaultMonitoringNamespace)
+}
+
 func isKorrel8rEndpointSlice(obj client.Object) bool {
 	serviceName := obj.GetLabels()[discoveryv1.LabelServiceName]
 	if obj.GetNamespace() == metav1.NamespaceDefault && serviceName == kubernetesServiceName {
@@ -725,6 +808,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(platformConfigPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isPrometheusWebTLSCASecret))).
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isKorrel8rEndpointSlice))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).

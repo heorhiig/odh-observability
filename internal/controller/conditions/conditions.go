@@ -231,7 +231,7 @@ func (cm *ConditionsManager) AggregateReady() {
 
 	switch {
 	case anyFailing:
-		cm.MarkTrue(string(platformcommon.ConditionTypeReady))
+		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "FeatureUnavailable", "A configured monitoring feature is unavailable")
 		cm.MarkTrue(string(platformcommon.ConditionTypeDegraded))
 	case anyUnknown:
 		cm.MarkUnknown(string(platformcommon.ConditionTypeReady))

@@ -69,6 +69,7 @@ const (
 	// otlpIdentitySpoofMetricPrefix prefixes the pushed metric name; a unique
 	// suffix per run keeps stale series from earlier runs irrelevant.
 	otlpIdentitySpoofMetricPrefix = "odh_observability_otlp_identity_probe"
+	otlpIdentityProbeNamespace    = "tests-monitoring-otlp-identity"
 )
 
 // ValidateTenantWorkloadMetricsNamespaceRestriction proves the end-to-end
@@ -144,8 +145,7 @@ func (tc *MonitoringTestCtx) ValidateTenantWorkloadMetricsNamespaceRestriction(t
 }
 
 // ValidateOTLPMetricIdentityCannotBeSpoofed proves the OTLP trust boundary:
-// a workload in the monitoring namespace (the only namespace the
-// NetworkPolicy lets push telemetry) sends a uniquely named metric whose
+// a workload in an enrolled namespace sends a uniquely named metric whose
 // resource attributes claim a real victim workload's namespace/pod identity,
 // in dotted and underscored spellings, plus forged pod IP/UID association hints.
 // The series must arrive, identify the sender, and remain invisible to an
@@ -165,6 +165,7 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 
 	tc.setupMetrics(t)
 	tc.ensureTenantMetricsEnvironment(t)
+	tc.ensureOTLPIdentityProbeNamespace(t)
 
 	otlpHost := tc.discoverCollectorOTLPHTTPHost(t)
 	runID := strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -172,16 +173,15 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 	// isolation: the authorized tenant identity must be able to see real data.
 	routeHost := tc.fetchPrometheusRouteHost(t)
 	rootCAs := clusterIngressCAPool(t, tc)
-	viewerToken := tc.metricsViewerToken(t, "otlp-identity-viewer", tc.MonitoringNamespace)
+	viewerToken := tc.metricsViewerToken(t, "otlp-identity-viewer", otlpIdentityProbeNamespace)
 	tenantToken := tc.requestServiceAccountToken(t, tenantMetricsNamespace, tenantMetricsServiceAccount)
 	victim = tc.readyTenantMetricsPodIdentity(t)
 	tc.requireTenantMetricsPositiveControl(t, rootCAs, routeHost, tenantToken, victim)
 
-	// Run probe from the monitoring namespace, matching the only OTLP ingress
-	// allowed by the collector NetworkPolicy. Keep it alive for warm-up and
-	// repeated attack submissions.
-	tc.createOTLPIdentityProbe(t)
-	probe := tc.readyOTLPIdentityProbe(t)
+	// Run an inference-labeled probe from the enrolled namespace. Keep it
+	// alive for warm-up and repeated attack submissions.
+	tc.createOTLPIdentityProbe(t, otlpIdentityProbeNamespace)
+	probe := tc.readyOTLPIdentityProbe(t, otlpIdentityProbeNamespace)
 	sender = podIdentity(probe)
 	require.NotEmpty(t, sender.IP, "OTLP identity probe must have a pod IP")
 
@@ -224,7 +224,7 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 		if payloadErr != nil {
 			evidence.lastPushFailed = true
 		} else {
-			push := tc.pushOTLPMetrics(t, otlpHost, payload)
+			push := tc.pushOTLPMetrics(t, sender.Namespace, otlpHost, payload)
 			evidence.pushAttempts++
 			evidence.lastPushStatus = push.status
 			evidence.lastPushFailed = push.err != nil
@@ -234,9 +234,9 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 		}
 
 		snapshot := otlpIdentitySnapshot{
-			at:         time.Now(),
-			monitoring: queryOTLPMetric(tc.Context(), rootCAs, routeHost, viewerToken, tc.MonitoringNamespace, metricName),
-			tenant:     queryOTLPMetric(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, metricName),
+			at:     time.Now(),
+			sender: queryOTLPMetric(tc.Context(), rootCAs, routeHost, viewerToken, sender.Namespace, metricName),
+			tenant: queryOTLPMetric(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, metricName),
 		}
 		evidence.snapshots = append(evidence.snapshots, snapshot)
 		if !time.Now().Before(deadline) {
@@ -333,9 +333,9 @@ func (observation otlpQueryObservation) successful() bool {
 }
 
 type otlpIdentitySnapshot struct {
-	at         time.Time
-	monitoring otlpQueryObservation
-	tenant     otlpQueryObservation
+	at     time.Time
+	sender otlpQueryObservation
+	tenant otlpQueryObservation
 }
 
 type otlpWarmupResult struct {
@@ -477,17 +477,52 @@ func (tc *MonitoringTestCtx) requireTenantMetricsPositiveControl(t *testing.T, r
 		"authorized tenant query must see real workload metrics before isolation is checked")
 }
 
-func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T) {
+func (tc *MonitoringTestCtx) ensureOTLPIdentityProbeNamespace(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
 
-	tc.deleteFixtureResources(otlpIdentitySpoofPodName)
-	t.Cleanup(func() { tc.deleteFixtureResources(otlpIdentitySpoofPodName) })
+	tc.DeleteResource(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: otlpIdentityProbeNamespace}),
+		WithIgnoreNotFound(true),
+		WithWaitForDeletion(true),
+	)
+	t.Cleanup(func() {
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: otlpIdentityProbeNamespace}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: otlpIdentityProbeNamespace}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			u.SetLabels(map[string]string{otlpNamespaceLabel: "true"})
+			return nil
+		}),
+	)
+}
+
+func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T, namespace string) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.DeleteResource(
+		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: otlpIdentitySpoofPodName, Namespace: namespace}),
+		WithIgnoreNotFound(true),
+		WithWaitForDeletion(true),
+	)
+	t.Cleanup(func() {
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Pod, types.NamespacedName{Name: otlpIdentitySpoofPodName, Namespace: namespace}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      otlpIdentitySpoofPodName,
-			Namespace: tc.MonitoringNamespace,
-			Labels:    map[string]string{"app": otlpIdentitySpoofPodName},
+			Namespace: namespace,
+			Labels:    otlpCallerNetworkPolicyLabels("llminferenceservice-workload"),
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
@@ -504,14 +539,14 @@ func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T) {
 	})
 }
 
-func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T) corev1.Pod {
+func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T, namespace string) corev1.Pod {
 	t.Helper()
 	tc = tc.WithT(t)
 
 	var probe corev1.Pod
 	tc.g.Eventually(func() error {
 		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
-			Name: otlpIdentitySpoofPodName, Namespace: tc.MonitoringNamespace,
+			Name: otlpIdentitySpoofPodName, Namespace: namespace,
 		}, &probe); err != nil {
 			return err
 		}
@@ -663,11 +698,11 @@ func (tc *MonitoringTestCtx) warmCollectorReplicas(
 				result.lastPushFailed = true
 				break
 			}
-			push := tc.pushOTLPMetrics(t, net.JoinHostPort(collector.Status.PodIP, "4318"), payload)
+			push := tc.pushOTLPMetrics(t, sender.Namespace, net.JoinHostPort(collector.Status.PodIP, "4318"), payload)
 			result.lastPushStatus = push.status
 			result.lastPushFailed = push.err != nil
 
-			query := queryOTLPMetric(tc.Context(), rootCAs, routeHost, viewerToken, tc.MonitoringNamespace, warmupQuery)
+			query := queryOTLPMetric(tc.Context(), rootCAs, routeHost, viewerToken, sender.Namespace, warmupQuery)
 			result.lastQueryStatus = query.status
 			result.lastQueryFailed = !query.successful()
 			result.lastQuerySeriesCount = len(query.series)
@@ -693,9 +728,9 @@ func (tc *MonitoringTestCtx) warmCollectorReplicas(
 	return results
 }
 
-func (tc *MonitoringTestCtx) pushOTLPMetrics(t *testing.T, address string, payload []byte) otlpPushObservation {
+func (tc *MonitoringTestCtx) pushOTLPMetrics(t *testing.T, namespace, address string, payload []byte) otlpPushObservation {
 	t.Helper()
-	stdout, stderr, err := tc.execOTLPProbe(t, []string{
+	stdout, stderr, err := tc.execOTLPProbe(t, namespace, []string{
 		"curl", "--silent", "--show-error", "--max-time", "15",
 		"--request", "POST", "--header", "Content-Type: application/json",
 		"--data-binary", "@-", "--write-out", "\\n%{http_code}", "http://" + address + "/v1/metrics",
@@ -761,7 +796,7 @@ func parseOTLPHTTPResponse(output string) (int, string, error) {
 	return status, body, nil
 }
 
-func (tc *MonitoringTestCtx) execOTLPProbe(t *testing.T, command []string, stdin []byte) (string, string, error) {
+func (tc *MonitoringTestCtx) execOTLPProbe(t *testing.T, namespace string, command []string, stdin []byte) (string, string, error) {
 	t.Helper()
 	tc = tc.WithT(t)
 
@@ -775,7 +810,7 @@ func (tc *MonitoringTestCtx) execOTLPProbe(t *testing.T, command []string, stdin
 	}
 	request := clientset.CoreV1().RESTClient().Post().
 		Resource("pods").Name(otlpIdentitySpoofPodName).
-		Namespace(tc.MonitoringNamespace).SubResource("exec").
+		Namespace(namespace).SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
 			Container: otlpIdentityProbeContainerName,
 			Command:   command,
@@ -802,8 +837,8 @@ func (tc *MonitoringTestCtx) execOTLPProbe(t *testing.T, command []string, stdin
 func otlpVisibleSeries(snapshots []otlpIdentitySnapshot) []map[string]string {
 	var series []map[string]string
 	for _, snapshot := range snapshots {
-		if snapshot.monitoring.successful() {
-			series = append(series, snapshot.monitoring.series...)
+		if snapshot.sender.successful() {
+			series = append(series, snapshot.sender.series...)
 		}
 		if snapshot.tenant.successful() {
 			series = append(series, snapshot.tenant.series...)
@@ -812,9 +847,9 @@ func otlpVisibleSeries(snapshots []otlpIdentitySnapshot) []map[string]string {
 	return series
 }
 
-func monitoringNamespaceObserved(snapshots []otlpIdentitySnapshot) bool {
+func senderNamespaceObserved(snapshots []otlpIdentitySnapshot) bool {
 	for _, snapshot := range snapshots {
-		if snapshot.monitoring.successful() && len(snapshot.monitoring.series) > 0 {
+		if snapshot.sender.successful() && len(snapshot.sender.series) > 0 {
 			return true
 		}
 	}
@@ -860,8 +895,8 @@ func otlpDeliveryError(evidence *otlpIdentityEvidence) error {
 		return fmt.Errorf("collector accepted no OTLP pushes after %d attempts (last HTTP status=%d, request failed=%t)",
 			evidence.pushAttempts, evidence.lastPushStatus, evidence.lastPushFailed)
 	}
-	if !monitoringNamespaceObserved(evidence.snapshots) {
-		return errors.New("accepted OTLP metrics were not observed under the monitoring namespace")
+	if !senderNamespaceObserved(evidence.snapshots) {
+		return errors.New("accepted OTLP metrics were not observed under the sender namespace")
 	}
 	return nil
 }
@@ -927,8 +962,8 @@ func (tc *MonitoringTestCtx) logOTLPIdentityDiagnostics(t *testing.T, evidence *
 	}
 	if len(evidence.snapshots) > 0 {
 		last := evidence.snapshots[len(evidence.snapshots)-1]
-		t.Logf("last monitoring query: status=%d failed=%t seriesCount=%d",
-			last.monitoring.status, !last.monitoring.successful(), len(last.monitoring.series))
+		t.Logf("last sender query: status=%d failed=%t seriesCount=%d",
+			last.sender.status, !last.sender.successful(), len(last.sender.series))
 		t.Logf("last tenant query: status=%d failed=%t seriesCount=%d",
 			last.tenant.status, !last.tenant.successful(), len(last.tenant.series))
 	}

@@ -95,6 +95,58 @@ func newMonitoring(name string) *v1alpha1.Monitoring {
 	}
 }
 
+func TestPreparePrometheusWebTLSCA(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	ca := &unstructured.Unstructured{}
+	ca.SetGroupVersionKind(controllergvk.ConfigMap)
+	ca.SetName(prometheusWebTLSCAConfigMapName)
+	ca.SetNamespace(m.Spec.Namespace)
+	stack := &unstructured.Unstructured{}
+	stack.SetGroupVersionKind(controllergvk.MonitoringStack)
+	stack.SetName("data-science-monitoringstack")
+	stack.SetNamespace(m.Spec.Namespace)
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(controllergvk.OpenTelemetryCollector)
+	collector.SetName("data-science-collector")
+	collector.SetNamespace(m.Spec.Namespace)
+	desired := []unstructured.Unstructured{*ca, *stack, *collector}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	r := newTestReconciler(t, s, cli)
+	ready, err := r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || ready {
+		t.Fatalf("expected CA to be pending before injection, got ready=%v error=%v", ready, err)
+	}
+
+	var created corev1.ConfigMap
+	if err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: prometheusWebTLSCAConfigMapName}, &created); err != nil {
+		t.Fatalf("CA ConfigMap was not applied before other resources: %v", err)
+	}
+	if got := withoutMonitoringStack(desired); len(got) != 2 || got[0].GetKind() != "ConfigMap" || got[1].GetKind() != "OpenTelemetryCollector" {
+		t.Fatalf("pending CA must omit only MonitoringStack, got %v", got)
+	}
+
+	created.Data = map[string]string{serviceCACertificateKey: "test-ca"}
+	if err := cli.Update(context.Background(), &created); err != nil {
+		t.Fatalf("injecting CA into ConfigMap: %v", err)
+	}
+	ready, err = r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || !ready {
+		t.Fatalf("expected CA Secret ready after injection, got ready=%v error=%v", ready, err)
+	}
+	var secret corev1.Secret
+	if err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: prometheusWebTLSCAConfigMapName}, &secret); err != nil {
+		t.Fatalf("CA Secret was not synchronized: %v", err)
+	}
+	if string(secret.Data[serviceCACertificateKey]) != "test-ca" {
+		t.Fatalf("CA Secret was not synchronized: data=%v", secret.Data)
+	}
+}
+
 func registerOperatorConditionTypes(s *runtime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v2", Kind: "OperatorCondition",
@@ -332,6 +384,20 @@ func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
 	}
 	if !k8serr.IsForbidden(err) {
 		t.Fatalf("expected forbidden lookup error, got: %v", err)
+	}
+	if m.Status.Phase != platformcommon.PhaseNotReady {
+		t.Fatalf("failed reconcile should set NotReady phase, got %s", m.Status.Phase)
+	}
+	for _, conditionType := range []string{string(platformcommon.ConditionTypeReady), string(platformcommon.ConditionTypeProvisioningSucceeded)} {
+		found := false
+		for _, condition := range m.Status.Conditions {
+			if condition.Type == conditionType {
+				found = condition.Status == metav1.ConditionFalse
+			}
+		}
+		if !found {
+			t.Errorf("%s must be False after reconciliation error", conditionType)
+		}
 	}
 	for _, condition := range m.Status.Conditions {
 		if condition.Reason == "MissingOperator" {

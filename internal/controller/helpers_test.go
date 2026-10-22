@@ -260,9 +260,9 @@ func TestSyncPrometheusWebTLSCA_NoMetrics(t *testing.T) {
 	m.Spec.Metrics = nil
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("expected ready without metrics, got ready=%v error=%v", ready, err)
 	}
 }
 
@@ -274,9 +274,9 @@ func TestSyncPrometheusWebTLSCA_ConfigMapMissing(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("expected no error when ConfigMap missing, got: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || ready {
+		t.Fatalf("expected pending when ConfigMap missing, got ready=%v error=%v", ready, err)
 	}
 }
 
@@ -297,9 +297,9 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	}, "data")
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("expected ready after Secret creation, got ready=%v error=%v", ready, err)
 	}
 
 	secret := &unstructured.Unstructured{}
@@ -327,6 +327,16 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	if string(decoded) != "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----" {
 		t.Errorf("decoded cert mismatch: %q", string(decoded))
 	}
+	if err := cli.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("deleting CA Secret: %v", err)
+	}
+	ready, err = syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("expected deleted CA Secret to be recreated, got ready=%v error=%v", ready, err)
+	}
+	if err := cli.Get(context.Background(), objKey(m.Spec.Namespace, prometheusWebTLSCAConfigMapName), secret); err != nil {
+		t.Fatalf("CA Secret was not recreated: %v", err)
+	}
 }
 
 func TestSyncPrometheusWebTLSCA_EmptyData(t *testing.T) {
@@ -344,9 +354,9 @@ func TestSyncPrometheusWebTLSCA_EmptyData(t *testing.T) {
 	// No data field at all
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("expected no error when ConfigMap has no data: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || ready {
+		t.Fatalf("expected pending when ConfigMap has no data, got ready=%v error=%v", ready, err)
 	}
 }
 

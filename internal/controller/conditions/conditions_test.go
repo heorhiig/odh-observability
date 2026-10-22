@@ -122,7 +122,7 @@ func TestAggregateReady_AllFeaturesWorking(t *testing.T) {
 }
 
 // TestAggregateReady_ConfiguredFeatureFailing: metrics is configured but the
-// MonitoringStack CRD is missing. Should be Ready=True, Degraded=True.
+// MonitoringStack CRD is missing. Should be Ready=False, Degraded=True.
 func TestAggregateReady_ConfiguredFeatureFailing(t *testing.T) {
 	cm, acc := newTestCM()
 	cm.MarkTrue(ConditionMonitoringDependenciesReady)
@@ -143,8 +143,8 @@ func TestAggregateReady_ConfiguredFeatureFailing(t *testing.T) {
 
 	cm.AggregateReady()
 
-	if got := ready(acc); got != metav1.ConditionTrue {
-		t.Errorf("Ready: want True, got %s", got)
+	if got := ready(acc); got != metav1.ConditionFalse {
+		t.Errorf("Ready: want False, got %s", got)
 	}
 	if got := degraded(acc); got != metav1.ConditionTrue {
 		t.Errorf("Degraded: want True, got %s", got)
@@ -175,7 +175,7 @@ func TestAggregateReady_PreconditionsFailed(t *testing.T) {
 }
 
 // TestAggregateReady_MixedNotConfiguredAndFailing: some features not configured,
-// one configured feature failing. Degraded=True, Ready=True.
+// one configured feature failing. Degraded=True, Ready=False.
 func TestAggregateReady_MixedNotConfiguredAndFailing(t *testing.T) {
 	cm, acc := newTestCM()
 	cm.MarkTrue(ConditionMonitoringDependenciesReady)
@@ -196,8 +196,8 @@ func TestAggregateReady_MixedNotConfiguredAndFailing(t *testing.T) {
 
 	cm.AggregateReady()
 
-	if got := ready(acc); got != metav1.ConditionTrue {
-		t.Errorf("Ready: want True, got %s", got)
+	if got := ready(acc); got != metav1.ConditionFalse {
+		t.Errorf("Ready: want False, got %s", got)
 	}
 	if got := degraded(acc); got != metav1.ConditionTrue {
 		t.Errorf("Degraded: want True, got %s", got)
