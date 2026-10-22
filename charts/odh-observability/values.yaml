@@ -58,26 +58,3 @@ affinity: {}
 env: []
 # - name: RELATED_IMAGE_PERSES_IMAGE
 #   value: "registry.redhat.io/cluster-observability-operator/perses-rhel9:1.5.0-1781116652"
-
-# Metrics configuration
-metrics:
-  # ServiceAccount that Prometheus uses to scrape the operator /metrics endpoint.
-  # Created by the MonitoringStack as <monitoringstack-name>-prometheus; granted
-  # read access to /metrics via the metrics-reader ClusterRoleBinding.
-  prometheusServiceAccount: data-science-monitoringstack-prometheus
-  serviceMonitor:
-    # Enable operator metrics ServiceMonitor creation.
-    #
-    # This MUST be enabled on supported deployments: the operator /metrics
-    # endpoint is the only source for the webhook health signals, and the
-    # following alerts are silently non-functional without it:
-    #   - MonitoringWebhookAdmissionErrors  (controller_runtime_webhook_requests_total)
-    #   - MonitoringWebhookAdmissionPathDown (webhook_admission_probe_* metrics)
-    #
-    # Disable ONLY on clusters where the ServiceMonitor CRD
-    # (monitoring.rhobs/v1 or monitoring.coreos.com/v1) is not yet installed;
-    # otherwise `helm install` fails with "no matches for kind ServiceMonitor".
-    # E2e tests create this manually after COO is installed.
-    enabled: false
-    # API version for ServiceMonitor (monitoring.rhobs/v1 for COO, monitoring.coreos.com/v1 for upstream)
-    apiVersion: monitoring.rhobs/v1
