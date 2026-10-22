@@ -440,6 +440,8 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 		deployUsageLogsCollector,
 		deployLokiStack,
 		deployAlerting,
+		deployOperatorMonitoring,
+		deployWebhookHealthProbe,
 		deployNodeMetricsEndpoint,
 		deployClusterLogForwarder,
 		deployKorrel8r,

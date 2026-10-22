@@ -11,6 +11,10 @@ metadata:
     description: "Health probe for webhook admission path - do not delete"
 spec:
   selector:
+    # Intentionally non-matching selector: this PodMonitor exists solely as a
+    # sentinel to exercise the admission webhook path. The probe verifies that
+    # the webhook injects monitoring.opendatahub.io/scrape=true at admission
+    # time; it does not need to select or scrape any real pods.
     matchLabels:
       app: webhook-health-probe-nonexistent
   podMetricsEndpoints:

@@ -68,19 +68,21 @@ func init() {
 // It exposes Prometheus metrics that the MonitoringWebhookAdmissionPathDown alert
 // uses to detect webhook failures.
 type AdmissionProbe struct {
-	client    client.Client
-	namespace string
-	interval  time.Duration
-	log       logr.Logger
+	client       client.Client
+	namespace    string
+	interval     time.Duration
+	retryTimeout time.Duration // how long runProbe polls waiting for the webhook; overridable in tests
+	log          logr.Logger
 }
 
 // NewAdmissionProbe creates a new webhook admission probe that runs every interval.
 func NewAdmissionProbe(client client.Client, namespace string, interval time.Duration) *AdmissionProbe {
 	return &AdmissionProbe{
-		client:    client,
-		namespace: namespace,
-		interval:  interval,
-		log:       ctrl.Log.WithName("webhook-probe"),
+		client:       client,
+		namespace:    namespace,
+		interval:     interval,
+		retryTimeout: 10 * time.Second,
+		log:          ctrl.Log.WithName("webhook-probe"),
 	}
 }
 
@@ -196,7 +198,7 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 	// startup — and any transient re-admission delay — does not record a false failure.
 	var labels map[string]string
 	var lastErr error
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(p.retryTimeout)
 	for {
 		// Re-trigger admission on each attempt by patching the (possibly unmutated)
 		// object, so a webhook that became ready after the initial write still runs.
