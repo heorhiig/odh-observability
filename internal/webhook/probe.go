@@ -92,6 +92,8 @@ func NewAdmissionProbe(client client.Client, namespace string, interval time.Dur
 func (p *AdmissionProbe) Start(ctx context.Context) error {
 	p.log.Info("starting webhook admission probe", "interval", p.interval, "namespace", p.namespace)
 
+	webhookProbeLastSuccessTimestamp.SetToCurrentTime()
+
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 

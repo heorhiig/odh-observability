@@ -965,6 +965,8 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.ThanosQuerier,
 		gvk.PodMonitor,
 		gvk.ServiceMonitor,
+		gvk.PodMonitorCoreos,
+		gvk.ServiceMonitorCoreos,
 	} {
 		tc.ensureCRDExists(t, required)
 	}

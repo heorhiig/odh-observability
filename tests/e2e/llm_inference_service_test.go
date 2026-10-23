@@ -765,7 +765,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	g.Eventually(func() bool {
 		pmList := &unstructured.UnstructuredList{}
-		pmList.SetGroupVersionKind(gvk.PodMonitor)
+		pmList.SetGroupVersionKind(gvk.PodMonitorCoreos)
 		if err := tc.Client().List(tc.Context(), pmList, client.InNamespace("default")); err != nil {
 			return true
 		}
