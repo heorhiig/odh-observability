@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -113,6 +114,21 @@ func (p *AdmissionProbe) Start(ctx context.Context) error {
 func (p *AdmissionProbe) runProbe(ctx context.Context) {
 	now := time.Now()
 	webhookProbeLastAttemptTimestamp.SetToCurrentTime()
+
+	// The webhook namespaceSelector only matches namespaces labeled scrape=true,
+	// so a canary in an unlabeled namespace can never be mutated.
+	probeNamespace := &corev1.Namespace{}
+	if err := p.client.Get(ctx, types.NamespacedName{Name: p.namespace}, probeNamespace); err != nil {
+		p.log.Error(err, "failed to get probe namespace", "namespace", p.namespace)
+		webhookProbeFailuresTotal.Inc()
+		return
+	}
+	if probeNamespace.GetLabels()[labelMonitoring] != "true" {
+		p.log.Error(nil, "probe namespace is not enrolled in webhook admission",
+			"namespace", p.namespace, "required_label", labelMonitoring+"=true")
+		webhookProbeFailuresTotal.Inc()
+		return
+	}
 
 	probePodMonitor := &unstructured.Unstructured{}
 	probePodMonitor.SetGroupVersionKind(schema.GroupVersionKind{

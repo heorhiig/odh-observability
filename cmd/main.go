@@ -139,18 +139,16 @@ func main() {
 			os.Exit(1)
 		}
 
-		monitoringNamespace := os.Getenv("MONITORING_NAMESPACE")
-		if monitoringNamespace == "" {
-			monitoringNamespace = os.Getenv("WATCH_NAMESPACE")
-		}
-		if monitoringNamespace != "" {
-			probe := monwebhook.NewAdmissionProbe(mgr.GetClient(), monitoringNamespace, 5*time.Minute)
+		// The probe namespace must carry monitoring.opendatahub.io/scrape=true for the
+		// webhook namespaceSelector to match the canary; the Helm chart provisions it.
+		if probeNamespace := os.Getenv("WEBHOOK_PROBE_NAMESPACE"); probeNamespace != "" {
+			probe := monwebhook.NewAdmissionProbe(mgr.GetClient(), probeNamespace, 5*time.Minute)
 			if err := mgr.Add(probe); err != nil {
 				setupLog.Error(err, "Unable to register webhook admission probe")
 				os.Exit(1)
 			}
 		} else {
-			setupLog.Info("Webhook admission probe disabled: MONITORING_NAMESPACE not set")
+			setupLog.Info("Webhook admission probe disabled: WEBHOOK_PROBE_NAMESPACE not set")
 		}
 	}
 

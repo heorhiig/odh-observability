@@ -264,6 +264,12 @@ The operator includes a mutating admission webhook that injects the `monitoring.
 
 This label is what makes the MonitoringStack's Prometheus instance discover and scrape the monitor.
 
+### Admission Probe
+
+Because the webhook uses `failurePolicy: Ignore`, an outage admits monitors without the scrape label and no client sees an error. The operator runs an in-process probe every 5 minutes that writes a canary PodMonitor and checks that the webhook labeled it; the result is exported as `webhook_admission_probe_*` metrics and drives the `MonitoringWebhookAdmissionPathDown` alert.
+
+The canary lives in a dedicated namespace (`webhook.probe.namespace`, default `<fullname>-webhook-probe`) that the Helm chart creates with `monitoring.opendatahub.io/scrape=true`, so the webhook `namespaceSelector` matches it without opting real monitors in the monitoring namespace into scraping. The operator reads the namespace from `WEBHOOK_PROBE_NAMESPACE`; the probe is disabled when it is unset and counts a failure when the namespace lacks the label.
+
 ### Self-Bootstrapping
 
 The webhook resources (Service, Certificate, Issuer, and MutatingWebhookConfiguration) are deployed by the Helm chart at install time, not by the operator.

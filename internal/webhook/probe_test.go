@@ -23,6 +23,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -212,10 +213,25 @@ func TestRunProbe_UnenrolledNamespace(t *testing.T) {
 			if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
 				t.Errorf("expected exactly one new failure for unenrolled namespace, got %v", got)
 			}
-			if _, ok := storedProbeLabels(t, c)[labelMonitoring]; ok {
-				t.Errorf("webhook must not mutate objects in an unenrolled namespace")
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(gvk.PodMonitor)
+			err := c.Get(context.Background(), client.ObjectKey{Namespace: probeTestNamespace, Name: probeObjectName}, obj)
+			if !k8serr.IsNotFound(err) {
+				t.Errorf("expected no canary to be written in an unenrolled namespace, got err=%v", err)
 			}
 		})
+	}
+}
+
+func TestRunProbe_MissingNamespace(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(newTestScheme()).Build()
+	p := newTestProbe(c)
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background())
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
+		t.Errorf("expected exactly one new failure when the probe namespace is missing, got %v", got)
 	}
 }
 
