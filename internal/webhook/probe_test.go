@@ -255,9 +255,7 @@ func TestRunProbe_ExistingCanaryWithStaleLabel(t *testing.T) {
 
 // --- Start: context cancellation --------------------------------------------
 
-func TestStart_SeedsSuccessTimestamp(t *testing.T) {
-	// An unenrolled namespace makes the first probe fail, so only the seed in
-	// Start can move the gauge off 0.
+func TestStart_DoesNotRecordSuccessBeforeProbe(t *testing.T) {
 	webhookProbeLastSuccessTimestamp.Set(0)
 	c := selectorAwareWebhookClient(t, nil)
 	p := NewAdmissionProbe(c, probeTestNamespace, time.Hour)
@@ -266,12 +264,11 @@ func TestStart_SeedsSuccessTimestamp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	floor := float64(time.Now().Add(-time.Second).Unix())
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("Start returned unexpected error: %v", err)
 	}
-	if got := gaugeValue(t, webhookProbeLastSuccessTimestamp); got < floor {
-		t.Errorf("expected success timestamp seeded at start, got %v", got)
+	if got := gaugeValue(t, webhookProbeLastSuccessTimestamp); got != 0 {
+		t.Errorf("expected no success timestamp before a successful probe, got %v", got)
 	}
 }
 

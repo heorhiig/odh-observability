@@ -108,14 +108,19 @@ spec:
 
         - alert: MonitoringWebhookAdmissionPathDown
           expr: |
-            # Periodic probe actively tests the webhook admission path by creating/patching
-            # a test PodMonitor and verifying the webhook adds the scrape label. This metric
-            # records the timestamp of the last successful probe. Alert fires when the probe
-            # hasn't succeeded in 15 minutes, indicating webhook Service, TLS cert,
-            # MutatingWebhookConfiguration, or endpoint is broken.
-            # Requires operator metrics ServiceMonitor to be enabled.
-            # If disabled, metric doesn't exist and alert won't fire.
-            (time() - webhook_admission_probe_last_success_timestamp_seconds) > 900
+            # Periodic probe creates a test PodMonitor and checks that the webhook labels it.
+            # Do not use last_success: a restart resets it and can hide an outage.
+            # Fire after repeated failures, or when attempts stop. last_attempt stays 0
+            # until the first probe, so time() - 0 must not count as a stall.
+            # Requires the operator metrics ServiceMonitor; if it is disabled the series
+            # are absent and the alert does not fire.
+            increase(webhook_admission_probe_failures_total[15m]) >= 3
+            or
+            (
+              webhook_admission_probe_last_attempt_timestamp_seconds > 0
+              and
+              (time() - webhook_admission_probe_last_attempt_timestamp_seconds) > 900
+            )
           for: 5m
           labels:
             severity: critical

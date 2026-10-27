@@ -73,11 +73,10 @@ type AdmissionProbe struct {
 	client       client.Client
 	namespace    string
 	interval     time.Duration
-	retryTimeout time.Duration // how long runProbe polls waiting for the webhook; overridable in tests
+	retryTimeout time.Duration
 	log          logr.Logger
 }
 
-// NewAdmissionProbe creates a new webhook admission probe that runs every interval.
 func NewAdmissionProbe(client client.Client, namespace string, interval time.Duration) *AdmissionProbe {
 	return &AdmissionProbe{
 		client:       client,
@@ -88,16 +87,12 @@ func NewAdmissionProbe(client client.Client, namespace string, interval time.Dur
 	}
 }
 
-// Start implements manager.Runnable.
 func (p *AdmissionProbe) Start(ctx context.Context) error {
 	p.log.Info("starting webhook admission probe", "interval", p.interval, "namespace", p.namespace)
-
-	webhookProbeLastSuccessTimestamp.SetToCurrentTime()
 
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 
-	// Run one probe immediately on startup
 	p.runProbe(ctx)
 
 	for {
@@ -219,8 +214,6 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 	var lastErr error
 	deadline := time.Now().Add(p.retryTimeout)
 	for {
-		// Re-trigger admission on each attempt by patching the (possibly unmutated)
-		// object, so a webhook that became ready after the initial write still runs.
 		current := &unstructured.Unstructured{}
 		current.SetGroupVersionKind(probePodMonitor.GroupVersionKind())
 		if err := p.client.Get(ctx, key, current); err != nil {
@@ -233,7 +226,6 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 			}
 			lastErr = errors.New("webhook did not add the scrape label")
 
-			// Nudge admission again (UPDATE is covered by the webhook rules).
 			current.SetAnnotations(mergeAnnotation(current.GetAnnotations(), "probe-retry-at", time.Now().Format(time.RFC3339Nano)))
 			if err := p.client.Update(ctx, current); err != nil && !k8serr.IsConflict(err) {
 				lastErr = fmt.Errorf("failed to re-trigger webhook admission: %w", err)
@@ -266,8 +258,6 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 	p.log.V(1).Info("webhook admission probe succeeded", "labels", labels)
 }
 
-// mergeAnnotation returns the annotation map with key=value set, allocating a new
-// map when the input is nil.
 func mergeAnnotation(annotations map[string]string, key, value string) map[string]string {
 	if annotations == nil {
 		annotations = make(map[string]string)
