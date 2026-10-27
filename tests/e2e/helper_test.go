@@ -1226,6 +1226,10 @@ func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 	if monitoringNS == "" {
 		monitoringNS = operatorNS
 	}
+	// Module-mode setup creates this namespace only after the ServiceMonitor.
+	// Konflux sets MONITORING_NAMESPACE to redhat-ods-monitoring before that
+	// namespace exists, so create it here first.
+	tc.ensureNamespaceExists(monitoringNS)
 
 	// Create the CA ConfigMap for service-ca injection
 	tc.EventuallyResourceCreatedOrPatched(
