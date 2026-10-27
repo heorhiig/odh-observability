@@ -2873,6 +2873,7 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 	t.Log("POST-body namespace bypass is closed: the method gate rejects non-GET/HEAD (403) before prom-label-proxy, independent of RBAC")
 
 	host := tc.routeHost(t, "data-science-prometheus-route")
+	rootCAs := clusterIngressCAPool(t, tc)
 
 	// Behavioral proof #1 (RBAC layer): a token authorized only for GET (verb "get")
 	// on pods.metrics.k8s.io issues a POST with the namespace in both the URL query
@@ -2890,17 +2891,18 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 
 	g := NewWithT(t)
 	g.Eventually(func(g Gomega) {
-		status, err := postPromQLForm(tc.Context(), host, getOnlyToken, tc.MonitoringNamespace, "openshift-monitoring")
+		status, _, err := postPromQLForm(tc.Context(), rootCAs, host, getOnlyToken, tc.MonitoringNamespace, "openshift-monitoring")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(status).To(Equal(http.StatusForbidden),
 			"POST with a get-only token must be rejected with 403; got %d", status)
 	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 
 	g.Eventually(func(g Gomega) {
-		status, err := postPromQLForm(tc.Context(), host, createToken, tc.MonitoringNamespace, "openshift-monitoring")
+		status, body, err := postPromQLForm(tc.Context(), rootCAs, host, createToken, tc.MonitoringNamespace, "openshift-monitoring")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(status).To(Equal(http.StatusForbidden),
 			"POST with a create-capable token must still be rejected with 403 by the method gate; got %d", status)
+		g.Expect(body).To(ContainSubstring("only GET and HEAD are allowed"))
 	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 }
 

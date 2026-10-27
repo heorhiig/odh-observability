@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -69,6 +70,11 @@ func init() {
 }
 
 func main() {
+	// Set a logger before the method-gate path returns. ctrl.Log discards
+	// records until SetLogger runs, so a failure there would exit silently.
+	// The controller path replaces this with the flag-configured logger below.
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
 	// The "method-gate" subcommand runs a minimal read-only reverse proxy that
 	// only forwards GET/HEAD (see runMethodGate). It reuses this operator image as
 	// a sidecar, so no extra container image has to be shipped for disconnected
@@ -237,7 +243,11 @@ func runMethodGate(argv []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go func() {
+	// ListenAndServe returns as soon as Shutdown closes the listener.
+	// Wait for this goroutine so in-flight connections finish draining
+	// before the process exits.
+	var drained sync.WaitGroup
+	drained.Go(func() {
 		<-ctx.Done()
 		// WithoutCancel keeps the parent's values while dropping its (already
 		// fired) cancellation, so the shutdown gets its own fresh deadline.
@@ -246,11 +256,12 @@ func runMethodGate(argv []string) error {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			setupLog.Error(err, "method gate shutdown failed")
 		}
-	}()
+	})
 
 	setupLog.Info("starting method gate", "listen", *listen, "upstream", *upstream)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("method gate exited: %w", err)
 	}
+	drained.Wait()
 	return nil
 }

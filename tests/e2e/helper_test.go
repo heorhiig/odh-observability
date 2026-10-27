@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net/http"
@@ -1300,8 +1301,10 @@ func (tc *MonitoringTestCtx) routeHost(t *testing.T, name string) string {
 }
 
 // postPromQLForm issues a POST to the namespace proxy with the namespace supplied
-// both as a URL query parameter and inside the form body, returning the HTTP status.
-func postPromQLForm(ctx context.Context, host, token, queryNamespace, bodyNamespace string) (int, error) {
+// both as a URL query parameter and inside the form body. It returns the HTTP
+// status and a bounded prefix of the response body. rootCAs is the cluster
+// ingress CA pool from clusterIngressCAPool.
+func postPromQLForm(ctx context.Context, rootCAs *x509.CertPool, host, token, queryNamespace, bodyNamespace string) (int, string, error) {
 	form := url.Values{}
 	form.Set("query", "up")
 	form.Set("namespace", bodyNamespace)
@@ -1309,22 +1312,27 @@ func postPromQLForm(ctx context.Context, host, token, queryNamespace, bodyNamesp
 	reqURL := fmt.Sprintf("https://%s/api/v1/query?namespace=%s", host, url.QueryEscape(queryNamespace))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	httpClient := &http.Client{
-		//nolint:gosec // This assertion checks an authorization 403, not TLS trust; the route uses a reencrypt serving cert.
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}},
-		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+		}},
+		Timeout: 30 * time.Second,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+	if err != nil {
+		return resp.StatusCode, "", err
+	}
 
-	return resp.StatusCode, nil
+	return resp.StatusCode, string(body), nil
 }
