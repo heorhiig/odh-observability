@@ -963,15 +963,15 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.LokiStack,
 		gvk.Perses,
 		gvk.ThanosQuerier,
-		gvk.CoreosPodMonitor,
-		gvk.CoreosServiceMonitor,
+		gvk.PodMonitorCoreos,
+		gvk.ServiceMonitorCoreos,
 		gvk.ServiceMonitor,
 	} {
 		tc.ensureCRDExists(t, required)
 	}
 
 	// Operator metrics use monitoring.rhobs/v1 (gvk.ServiceMonitor), which COO
-	// installs. CoreosServiceMonitor above is the webhook target and a different CRD.
+	// installs. ServiceMonitorCoreos above is the webhook target and a different CRD.
 	// Create the operator ServiceMonitor in Module mode only.
 	if tc.ApiMode == APIModeModule {
 		tc.ensureOperatorServiceMonitor(t)
