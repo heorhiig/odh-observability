@@ -25,6 +25,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
