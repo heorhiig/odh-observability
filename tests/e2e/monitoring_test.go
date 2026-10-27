@@ -1,9 +1,11 @@
 package e2e_test
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
@@ -2855,11 +2859,23 @@ func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorizati
 
 	tc.verifyOperatorMetricsRBAC(t)
 
-	operatorNS := tc.ensureOperatorDeploymentReady(t)
+	// The suite creates this ServiceMonitor during module-mode setup only.
+	// DSC runs the same test, and the chart leaves the CA out unless
+	// metrics.serviceMonitor.enabled is set, so create it here for both modes.
+	tc.ensureOperatorServiceMonitor(t)
+
+	// ensureOperatorDeploymentReady returns MONITORING_NAMESPACE. The metrics
+	// Service and its DNS name live in the operator Deployment namespace.
+	// NetworkPolicy accepts :8443 only from the monitoring namespace, so the
+	// probe has to run in a pod there rather than in the test process.
+	monitoringNS := tc.ensureOperatorDeploymentReady(t)
+	operatorNS := tc.operatorDeploymentNamespace(t)
 	serviceHost := fmt.Sprintf("odh-observability-metrics.%s.svc:8443", operatorNS)
+	tc.waitForOperatorMetricsCA(t, monitoringNS)
+	tc.ensureOperatorMetricsProbePod(t, monitoringNS)
 
 	t.Run("Unauthenticated request returns 401", func(t *testing.T) {
-		statusCode := tc.probeOperatorMetrics(t, operatorNS, serviceHost, "")
+		statusCode := tc.probeOperatorMetrics(t, monitoringNS, serviceHost, "")
 		if statusCode != http.StatusUnauthorized {
 			t.Errorf("unauthenticated request to /metrics should return 401, got %d", statusCode)
 		}
@@ -2869,7 +2885,7 @@ func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorizati
 		unauthorizedSA := tc.createServiceAccountForMetricsTest(t, operatorNS, "metrics-unauthorized-test")
 		unauthorizedToken := tc.getServiceAccountToken(t, operatorNS, unauthorizedSA)
 
-		statusCode := tc.probeOperatorMetrics(t, operatorNS, serviceHost, unauthorizedToken)
+		statusCode := tc.probeOperatorMetrics(t, monitoringNS, serviceHost, unauthorizedToken)
 		if statusCode != http.StatusForbidden {
 			t.Errorf("unauthorized request to /metrics should return 403, got %d", statusCode)
 		}
@@ -2877,11 +2893,15 @@ func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorizati
 
 	t.Run("Authorized request returns 200", func(t *testing.T) {
 		prometheusSA := fmt.Sprintf("%s-prometheus", MonitoringStackName)
-		authorizedToken := tc.getServiceAccountToken(t, tc.MonitoringNamespace, prometheusSA)
+		tokenNamespace := tc.MonitoringNamespace
+		if tokenNamespace == "" {
+			tokenNamespace = monitoringNS
+		}
+		authorizedToken := tc.getServiceAccountToken(t, tokenNamespace, prometheusSA)
 
 		var statusCode int
 		tc.g.Eventually(func() error {
-			statusCode = tc.probeOperatorMetrics(t, operatorNS, serviceHost, authorizedToken)
+			statusCode = tc.probeOperatorMetrics(t, monitoringNS, serviceHost, authorizedToken)
 			if statusCode != http.StatusOK {
 				return fmt.Errorf("authorized request to /metrics should return 200, got %d", statusCode)
 			}
@@ -2967,59 +2987,151 @@ func (tc *MonitoringTestCtx) getServiceAccountToken(t *testing.T, namespace, ser
 	return tokenRequest.Status.Token
 }
 
-func (tc *MonitoringTestCtx) probeOperatorMetrics(t *testing.T, namespace, serviceHost, token string) int {
+const (
+	operatorMetricsProbePodName = "operator-metrics-auth-probe"
+	operatorMetricsCAConfigMap  = "odh-observability-metrics-ca"
+)
+
+func (tc *MonitoringTestCtx) waitForOperatorMetricsCA(t *testing.T, monitoringNS string) {
 	t.Helper()
 
-	caConfigMap := &corev1.ConfigMap{}
-	if err := tc.Client().Get(tc.Context(), types.NamespacedName{
-		Name:      "odh-observability-metrics-ca",
-		Namespace: namespace,
-	}, caConfigMap); err != nil {
-		t.Fatalf("failed to get metrics CA ConfigMap: %v", err)
-	}
+	tc.g.Eventually(func() error {
+		caConfigMap := &corev1.ConfigMap{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      operatorMetricsCAConfigMap,
+			Namespace: monitoringNS,
+		}, caConfigMap); err != nil {
+			return err
+		}
+		if caConfigMap.Data["service-ca.crt"] == "" {
+			return fmt.Errorf("service-ca.crt is not injected into %s/%s yet", monitoringNS, operatorMetricsCAConfigMap)
+		}
+		return nil
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"operator metrics CA ConfigMap should exist in the monitoring namespace")
+}
 
-	caCert, ok := caConfigMap.Data["service-ca.crt"]
-	if !ok {
-		t.Fatalf("service-ca.crt not found in metrics CA ConfigMap")
-	}
+func (tc *MonitoringTestCtx) ensureOperatorMetricsProbePod(t *testing.T, monitoringNS string) {
+	t.Helper()
 
-	caCertPool := x509.NewCertPool()
-	if !caCertPool.AppendCertsFromPEM([]byte(caCert)) {
-		t.Fatalf("failed to parse service CA certificate")
-	}
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				RootCAs:    caCertPool,
-			},
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      operatorMetricsProbePodName,
+			Namespace: monitoringNS,
 		},
-		Timeout: 10 * time.Second,
+		Spec: corev1.PodSpec{
+			RestartPolicy:   corev1.RestartPolicyAlways,
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "curl",
+				Image:           fakeGCSClientImage,
+				ImagePullPolicy: corev1.PullIfNotPresent,
+				Command:         []string{"sleep", "3600"},
+				SecurityContext: fixtureContainerSecurityContext(),
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "metrics-ca",
+					MountPath: "/ca",
+					ReadOnly:  true,
+				}},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "metrics-ca",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: operatorMetricsCAConfigMap},
+					},
+				},
+			}},
+		},
 	}
-
-	endpoint := fmt.Sprintf("https://%s/metrics", serviceHost)
-	req, err := http.NewRequestWithContext(tc.Context(), http.MethodGet, endpoint, nil)
-	if err != nil {
-		t.Fatalf("failed to create HTTP request: %v", err)
+	if err := tc.Client().Create(tc.Context(), pod); err != nil && !k8serr.IsAlreadyExists(err) {
+		t.Fatalf("failed to create operator metrics probe pod: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), pod); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("failed to delete operator metrics probe pod: %v", err)
+		}
+	})
 
+	tc.g.Eventually(func() error {
+		current := &corev1.Pod{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      operatorMetricsProbePodName,
+			Namespace: monitoringNS,
+		}, current); err != nil {
+			return err
+		}
+		if current.Status.Phase != corev1.PodRunning {
+			return fmt.Errorf("probe pod is %s", current.Status.Phase)
+		}
+		for _, container := range current.Status.ContainerStatuses {
+			if container.Name == "curl" && container.Ready {
+				return nil
+			}
+		}
+		return errors.New("curl container is not ready")
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"operator metrics probe pod should be running in the monitoring namespace")
+}
+
+func (tc *MonitoringTestCtx) probeOperatorMetrics(t *testing.T, monitoringNS, serviceHost, token string) int {
+	t.Helper()
+
+	args := []string{
+		"curl", "--noproxy", "*", "-sS",
+		"--connect-timeout", "5", "--max-time", "10",
+		"--cacert", "/ca/service-ca.crt",
+		"-o", "/dev/null", "-w", "%{http_code}",
+	}
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		args = append(args, "-H", "Authorization: Bearer "+token)
 	}
+	args = append(args, "https://"+serviceHost+"/metrics")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		t.Logf("HTTP request to %s failed: %v", endpoint, err)
+	stdout, stderr, err := tc.execOperatorMetricsProbe(t, monitoringNS, args)
+	statusCode, convErr := strconv.Atoi(strings.TrimSpace(stdout))
+	if err != nil || convErr != nil || statusCode == 0 {
+		t.Logf("operator metrics probe from %s/%s failed: status=%q err=%v stderr=%s",
+			monitoringNS, operatorMetricsProbePodName, strings.TrimSpace(stdout), err, strings.TrimSpace(stderr))
 		return 0
 	}
-	defer resp.Body.Close()
+	t.Logf("operator metrics probe from %s: status=%d", monitoringNS, statusCode)
+	return statusCode
+}
 
-	// Read response body for debugging
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10)) // Read up to 1KB
-	t.Logf("Operator metrics probe: status=%d, body_preview=%s", resp.StatusCode, string(body[:min(len(body), 200)]))
+func (tc *MonitoringTestCtx) execOperatorMetricsProbe(t *testing.T, monitoringNS string, command []string) (string, string, error) {
+	t.Helper()
 
-	return resp.StatusCode
+	cfg, err := ctrlcfg.GetConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("load kubeconfig for pod exec: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes client for pod exec: %w", err)
+	}
+	request := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").Name(operatorMetricsProbePodName).
+		Namespace(monitoringNS).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "curl",
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, clientgoscheme.ParameterCodec)
+	executor, err := remotecommand.NewSPDYExecutor(cfg, http.MethodPost, request.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes pod exec stream: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), 30*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
 }
 
 // ========================================================================

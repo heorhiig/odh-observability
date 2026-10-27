@@ -687,6 +687,23 @@ func (tc *TestContext) ensureOperatorDeploymentReady(t *testing.T) string {
 	return monitoringNamespace
 }
 
+// operatorDeploymentNamespace is the namespace of the odh-observability
+// Deployment. The metrics Service is created there. It is not
+// MONITORING_NAMESPACE, which ensureOperatorDeploymentReady returns and which
+// is where the MonitoringStack Prometheus runs.
+func (tc *TestContext) operatorDeploymentNamespace(t *testing.T) string {
+	t.Helper()
+
+	deployments := &appsv1.DeploymentList{}
+	if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+		t.Fatalf("listing odh-observability Deployments: %v", err)
+	}
+	if len(deployments.Items) != 1 {
+		t.Fatalf("expected one odh-observability Deployment, found %d", len(deployments.Items))
+	}
+	return deployments.Items[0].Namespace
+}
+
 // ensureCRDExists verifies that a CRD is registered on the cluster and fails
 // the test immediately if it is not.
 func (tc *TestContext) ensureCRDExists(t *testing.T, g schema.GroupVersionKind) {

@@ -30,10 +30,10 @@ spec:
   - ports:
     - protocol: TCP
       port: 8081
-  # Webhook (9443) — ingress from API server CIDRs
-  # Rationale: kube-apiserver source varies by topology (service network for standard,
-  # pod network for self-hosted, external for managed services). CIDRs are configurable
-  # via .Values.webhookIngressCIDRs to accommodate cluster-specific requirements.
+  # Webhook (9443) — ingress from .Values.webhookIngressCIDRs.
+  # kube-apiserver runs on the host network, so packets come from a node IP in
+  # the cluster machine CIDR. Defaults match the OpenShift and ROSA install
+  # defaults; replace the machine CIDR when the cluster was created with another.
   - ports:
     - protocol: TCP
       port: 9443

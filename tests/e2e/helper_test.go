@@ -965,12 +965,14 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.ThanosQuerier,
 		gvk.CoreosPodMonitor,
 		gvk.CoreosServiceMonitor,
+		gvk.ServiceMonitor,
 	} {
 		tc.ensureCRDExists(t, required)
 	}
 
-	// After the COO ServiceMonitor CRD is confirmed above, create the
-	// operator's metrics-ca ConfigMap and ServiceMonitor in Module mode only.
+	// Operator metrics use monitoring.rhobs/v1 (gvk.ServiceMonitor), which COO
+	// installs. CoreosServiceMonitor above is the webhook target and a different CRD.
+	// Create the operator ServiceMonitor in Module mode only.
 	if tc.ApiMode == APIModeModule {
 		tc.ensureOperatorServiceMonitor(t)
 	}
@@ -1215,12 +1217,19 @@ func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 		t.Fatalf("odh-observability Deployment not found")
 	}
 	operatorNS := deployments.Items[0].GetNamespace()
+	monitoringNS := monitoringNamespaceFromDeployment(&deployments.Items[0])
+	if monitoringNS == "" {
+		monitoringNS = tc.MonitoringNamespace
+	}
+	if monitoringNS == "" {
+		monitoringNS = operatorNS
+	}
 
 	// Create the CA ConfigMap for service-ca injection
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
 			Name:      "odh-observability-metrics-ca",
-			Namespace: operatorNS,
+			Namespace: monitoringNS,
 		}),
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
 			annotations := map[string]any{
@@ -1233,9 +1242,9 @@ func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 
 	// Create the ServiceMonitor for operator metrics
 	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      "odh-observability-metrics",
-			Namespace: operatorNS,
+			Namespace: monitoringNS,
 		}),
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
 			spec := map[string]any{
@@ -1271,7 +1280,28 @@ func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
 		WithCustomErrorMsg("operator ServiceMonitor should be created after COO CRD is available"),
 	)
 
-	t.Logf("created operator ServiceMonitor in namespace %s", operatorNS)
+	t.Logf("created operator ServiceMonitor in namespace %s for Service in %s", monitoringNS, operatorNS)
+}
+
+func monitoringNamespaceFromDeployment(deployment *unstructured.Unstructured) string {
+	containers, _, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+	for _, raw := range containers {
+		container, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		envs, _, _ := unstructured.NestedSlice(container, "env")
+		for _, rawEnv := range envs {
+			env, ok := rawEnv.(map[string]any)
+			if !ok || env["name"] != "MONITORING_NAMESPACE" {
+				continue
+			}
+			if value, ok := env["value"].(string); ok {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 // Suppress unused warnings for transform functions used in later commits.
