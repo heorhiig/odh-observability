@@ -1097,8 +1097,39 @@ func proxyTemplateData() map[string]any {
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
 		"HTTPMethodGateImage": "example.invalid/method-gate:test",
-		"TLSMinVersion":       "VersionTLS12",
-		"TLSCipherSuites":     "",
+		"TLSMinVersion":       proxyTLSVersion12,
+		"TLSCipherSuites":     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLSCurvePreferences": "29,25",
+	}
+}
+
+func TestProxyTemplatesTLS13OmitCipherRestriction(t *testing.T) {
+	proxyTemplates := []struct {
+		template       string
+		deploymentName string
+	}{
+		{template: PrometheusNamespaceProxyTemplate, deploymentName: "data-science-prometheus-namespace-proxy"},
+		{template: PrometheusClusterProxyTemplate, deploymentName: "data-science-prometheus-cluster-proxy"},
+		{template: ThanosQuerierProxyTemplate, deploymentName: "data-science-thanos-querier-proxy"},
+	}
+
+	for _, proxy := range proxyTemplates {
+		t.Run(proxy.deploymentName, func(t *testing.T) {
+			data := proxyTemplateData()
+			data["TLSMinVersion"] = proxyTLSVersion13
+			data["TLSCipherSuites"] = ""
+			data["TLSCurvePreferences"] = "23,29"
+
+			resources := renderObservabilityTemplate(t, proxy.template, data)
+			deployment := findRenderedResource(t, resources, "Deployment", proxy.deploymentName)
+			containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
+			container := findContainer(t, containers, "kube-rbac-proxy")
+			assertContainerArgs(t, container,
+				"--tls-min-version="+proxyTLSVersion13,
+				"--tls-curve-preferences=23,29",
+			)
+			assertContainerArgAbsent(t, container, "--tls-cipher-suites=")
+		})
 	}
 }
 

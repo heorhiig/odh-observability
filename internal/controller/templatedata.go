@@ -165,14 +165,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	addResourceData(templateData)
-	if err := addImageURLs(templateData); err != nil {
-		return nil, err
-	}
-
-	if err := addTLSData(ctx, c, templateData); err != nil {
-		return nil, err
-	}
-	if err := addKorrel8rAPIServerData(ctx, c, monitoring, templateData); err != nil {
+	if err := addImageTLSAndKorrel8rData(ctx, c, monitoring, templateData); err != nil {
 		return nil, err
 	}
 
@@ -604,6 +597,16 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 	return nil
 }
 
+func addImageTLSAndKorrel8rData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {
+	if err := addImageURLs(templateData); err != nil {
+		return err
+	}
+	if err := addTLSData(ctx, c, templateData); err != nil {
+		return err
+	}
+	return addKorrel8rAPIServerData(ctx, c, monitoring, templateData)
+}
+
 func addImageURLs(templateData map[string]any) error {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
@@ -620,7 +623,7 @@ func addImageURLs(templateData map[string]any) error {
 	// Deployment to the operator's own image.
 	image := os.Getenv("OPERATOR_IMAGE")
 	if image == "" {
-		return fmt.Errorf("OPERATOR_IMAGE is empty: the method-gate sidecar must use this operator image")
+		return errors.New("OPERATOR_IMAGE is empty: the method-gate sidecar must use this operator image")
 	}
 	templateData["HTTPMethodGateImage"] = image
 	return nil
