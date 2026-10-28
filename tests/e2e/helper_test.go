@@ -970,12 +970,18 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.LokiStack,
 		gvk.Perses,
 		gvk.ThanosQuerier,
-		gvk.PodMonitor,
-		gvk.ServiceMonitor,
 		gvk.PodMonitorCoreos,
 		gvk.ServiceMonitorCoreos,
+		gvk.ServiceMonitor,
 	} {
 		tc.ensureCRDExists(t, required)
+	}
+
+	// Operator metrics use monitoring.rhobs/v1 (gvk.ServiceMonitor), which COO
+	// installs. ServiceMonitorCoreos above is the webhook target and a different CRD.
+	// Create the operator ServiceMonitor in Module mode only.
+	if tc.ApiMode == APIModeModule {
+		tc.ensureOperatorServiceMonitor(t)
 	}
 
 	tc.ensureMonitoringCRExists(t)
@@ -1199,6 +1205,116 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 		return
 	}
 	t.Fatalf("Loki Operator is required; %s PackageManifest is missing from redhat-operators", lokiOpName)
+}
+
+// ensureOperatorServiceMonitor creates the operator's ServiceMonitor after COO is installed.
+// This enables metrics scraping for the odh-observability operator itself.
+func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
+	t.Helper()
+
+	// Get the operator deployment to find its namespace
+	deployments := &unstructured.UnstructuredList{}
+	deployments.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "DeploymentList",
+	})
+	if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+		t.Fatalf("failed to list odh-observability Deployment: %v", err)
+	}
+	if len(deployments.Items) == 0 {
+		t.Fatalf("odh-observability Deployment not found")
+	}
+	operatorNS := deployments.Items[0].GetNamespace()
+	monitoringNS := monitoringNamespaceFromDeployment(&deployments.Items[0])
+	if monitoringNS == "" {
+		monitoringNS = tc.MonitoringNamespace
+	}
+	if monitoringNS == "" {
+		monitoringNS = operatorNS
+	}
+	// Module-mode setup creates this namespace only after the ServiceMonitor.
+	// Konflux sets MONITORING_NAMESPACE to redhat-ods-monitoring before that
+	// namespace exists, so create it here first.
+	tc.ensureNamespaceExists(monitoringNS)
+
+	// Create the CA ConfigMap for service-ca injection
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name:      "odh-observability-metrics-ca",
+			Namespace: monitoringNS,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			annotations := map[string]any{
+				"service.beta.openshift.io/inject-cabundle": "true",
+			}
+			return unstructured.SetNestedMap(u.Object, annotations, "metadata", "annotations")
+		}),
+		WithCustomErrorMsg("operator metrics CA ConfigMap should be created"),
+	)
+
+	// Create the ServiceMonitor for operator metrics
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
+			Name:      "odh-observability-metrics",
+			Namespace: monitoringNS,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			spec := map[string]any{
+				"endpoints": []any{
+					map[string]any{
+						"path":            "/metrics",
+						"port":            "https",
+						"scheme":          "https",
+						"bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+						"tlsConfig": map[string]any{
+							"ca": map[string]any{
+								"configMap": map[string]any{
+									"name": "odh-observability-metrics-ca",
+									"key":  "service-ca.crt",
+								},
+							},
+							"serverName": fmt.Sprintf("odh-observability-metrics.%s.svc", operatorNS),
+						},
+					},
+				},
+				"selector": map[string]any{
+					"matchLabels": map[string]any{
+						"app.kubernetes.io/name":     "odh-observability",
+						"app.kubernetes.io/instance": "odh-observability",
+					},
+				},
+				"namespaceSelector": map[string]any{
+					"matchNames": []any{operatorNS},
+				},
+			}
+			return unstructured.SetNestedMap(u.Object, spec, "spec")
+		}),
+		WithCustomErrorMsg("operator ServiceMonitor should be created after COO CRD is available"),
+	)
+
+	t.Logf("created operator ServiceMonitor in namespace %s for Service in %s", monitoringNS, operatorNS)
+}
+
+func monitoringNamespaceFromDeployment(deployment *unstructured.Unstructured) string {
+	containers, _, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+	for _, raw := range containers {
+		container, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		envs, _, _ := unstructured.NestedSlice(container, "env")
+		for _, rawEnv := range envs {
+			env, ok := rawEnv.(map[string]any)
+			if !ok || env["name"] != "MONITORING_NAMESPACE" {
+				continue
+			}
+			if value, ok := env["value"].(string); ok {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 // Suppress unused warnings for transform functions used in later commits.

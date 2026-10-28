@@ -421,6 +421,7 @@ func deployPersesTempoIntegration(
 	persesFound bool,
 ) error {
 	_, datasourceGVK, dashboardGVK := persesGVKs(persesVersion)
+	namespace := monitoringNamespace(monitoring)
 
 	var datasourceExists, dashboardExists bool
 	var err error
@@ -442,7 +443,7 @@ func deployPersesTempoIntegration(
 			ds := &unstructured.Unstructured{}
 			ds.SetGroupVersionKind(datasourceGVK)
 			ds.SetName(PersesTempoDatasourceName)
-			ds.SetNamespace(monitoring.Spec.Namespace)
+			ds.SetNamespace(namespace)
 			if err := c.Delete(ctx, ds); err != nil && !k8serr.IsNotFound(err) {
 				return fmt.Errorf("deleting PersesDatasource: %w", err)
 			}
@@ -451,7 +452,7 @@ func deployPersesTempoIntegration(
 			db := &unstructured.Unstructured{}
 			db.SetGroupVersionKind(dashboardGVK)
 			db.SetName(PersesTempoDashboardName)
-			db.SetNamespace(monitoring.Spec.Namespace)
+			db.SetNamespace(namespace)
 			if err := c.Delete(ctx, db); err != nil && !k8serr.IsNotFound(err) {
 				return fmt.Errorf("deleting PersesDashboard: %w", err)
 			}
@@ -841,6 +842,9 @@ func deployWebhookInfrastructure(
 
 func monitoringNamespace(monitoring *v1alpha1.Monitoring) string {
 	if monitoring.Spec.Namespace == "" {
+		if configured := os.Getenv("MONITORING_NAMESPACE"); configured != "" {
+			return configured
+		}
 		return defaultMonitoringNamespace
 	}
 	return monitoring.Spec.Namespace

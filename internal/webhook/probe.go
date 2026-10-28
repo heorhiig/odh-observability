@@ -207,7 +207,7 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 
 	// Read back and verify the webhook added the scrape label. The webhook server
 	// (which runs in this same pod) may not be serving yet right after startup, and
-	// with failurePolicy=Ignore the API server silently admits the object unmutated
+	// with failurePolicy=Ignore configured, the API server silently admits the object unmutated
 	// until the webhook is reachable. Poll for a few seconds so the first probe after
 	// startup — and any transient re-admission delay — does not record a false failure.
 	var labels map[string]string

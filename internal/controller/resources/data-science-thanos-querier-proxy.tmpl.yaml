@@ -57,6 +57,7 @@ data:
       resourceAttributes:
         apiGroup: metrics.k8s.io
         resource: pods
+        verb: get
         namespace: "{{ "{{ .Value }}" }}"
 ---
 # REQUIRED QUERY FORMAT: /api/v1/query?query=<promql>&namespace=<namespace-name>
@@ -95,6 +96,9 @@ spec:
             - --tls-min-version={{.TLSMinVersion}}
             {{- if .TLSCipherSuites}}
             - --tls-cipher-suites={{.TLSCipherSuites}}
+            {{- end}}
+            {{- if .TLSCurvePreferences}}
+            - --tls-curve-preferences={{.TLSCurvePreferences}}
             {{- end}}
             - --logtostderr=true
             - --v=2

@@ -831,6 +831,47 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	}
 }
 
+func TestDeployPersesTempoIntegrationUsesConfiguredMonitoringNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "custom-monitoring")
+	s := newActionsTestScheme(t)
+	_, datasourceGVK, dashboardGVK := persesGVKs(persesV1Alpha2)
+	registerCRDs(s, datasourceGVK, dashboardGVK)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+
+	datasource := &unstructured.Unstructured{}
+	datasource.SetGroupVersionKind(datasourceGVK)
+	datasource.SetName(PersesTempoDatasourceName)
+	datasource.SetNamespace("custom-monitoring")
+	dashboard := &unstructured.Unstructured{}
+	dashboard.SetGroupVersionKind(dashboardGVK)
+	dashboard.SetName(PersesTempoDashboardName)
+	dashboard.SetNamespace("custom-monitoring")
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(datasource, dashboard).
+		Build()
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if err := deployPersesTempoIntegration(context.Background(), cli, m, cm, &sources, persesV1Alpha2, true); err != nil {
+		t.Fatalf("deployPersesTempoIntegration: %v", err)
+	}
+
+	if err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: "custom-monitoring",
+		Name:      PersesTempoDatasourceName,
+	}, datasource); err == nil {
+		t.Fatal("expected Perses datasource to be deleted from the configured namespace")
+	}
+	if err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: "custom-monitoring",
+		Name:      PersesTempoDashboardName,
+	}, dashboard); err == nil {
+		t.Fatal("expected Perses dashboard to be deleted from the configured namespace")
+	}
+}
+
 // --- deployClusterLogForwarder ---
 
 func TestDeployClusterLogForwarder_NoLogs(t *testing.T) {

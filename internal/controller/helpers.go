@@ -151,13 +151,15 @@ func listAllNamespaces(ctx context.Context, c client.Client, fallback string) ([
 // TargetAllocator's per-namespace Secret read Role. Kubernetes does not have a
 // portable system-namespace marker, so account for the built-in namespaces and
 // the system markers used by OpenShift, HyperShift, and OLM.
+const kubeSystemNamespace = "kube-system"
+
 func isSystemNamespace(namespace *corev1.Namespace) bool {
 	if namespace == nil {
 		return true
 	}
 
 	switch namespace.Name {
-	case "", "default", "kube-system", "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
+	case "", "default", kubeSystemNamespace, "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
 		return true
 	}
 
@@ -200,7 +202,7 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 		return true, nil
 	}
 
-	namespace := monitoring.Spec.Namespace
+	namespace := monitoringNamespace(monitoring)
 
 	var configMap unstructured.Unstructured
 	configMap.SetAPIVersion("v1")
@@ -279,7 +281,7 @@ func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, m
 		return nil
 	}
 
-	namespace := monitoring.Spec.Namespace
+	namespace := monitoringNamespace(monitoring)
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
 	configMap.SetKind("ConfigMap")
@@ -330,7 +332,7 @@ func syncStatusURL(ctx context.Context, c client.Client, monitoring *v1alpha1.Mo
 
 	route := &routev1.Route{}
 	if err := c.Get(ctx, client.ObjectKey{
-		Namespace: monitoring.Spec.Namespace,
+		Namespace: monitoringNamespace(monitoring),
 		Name:      thanosQuerierRouteName,
 	}, route); err != nil {
 		monitoring.Status.URL = ""

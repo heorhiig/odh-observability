@@ -82,6 +82,9 @@ data:
       resourceAttributes:
         apiGroup: metrics.k8s.io
         resource: pods
+        # Perses sends read-only queries with POST. Authorize the requested
+        # namespace with the existing metrics read permission for both methods.
+        verb: get
         namespace: "{{ "{{ .Value }}" }}"
 ---
 #
@@ -120,6 +123,9 @@ spec:
             - --tls-min-version={{.TLSMinVersion}}
             {{- if .TLSCipherSuites}}
             - --tls-cipher-suites={{.TLSCipherSuites}}
+            {{- end}}
+            {{- if .TLSCurvePreferences}}
+            - --tls-curve-preferences={{.TLSCurvePreferences}}
             {{- end}}
             - --logtostderr=true
             - --v=2

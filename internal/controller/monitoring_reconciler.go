@@ -122,6 +122,7 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 // +kubebuilder:rbac:urls=/metrics;/api;/api/*;/apis;/apis/*,verbs=get
 
 func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -220,7 +221,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	if monitoring.Spec.ManagementState == platformcommon.Removed {
 		log.Info("ManagementState is Removed, deleting all owned resources")
 		if err := r.deleteAllOwned(ctx, monitoring); err != nil {
-			log.Error(err, "Failed to delete owned resources, will retry on next reconcile")
+			log.Error(err, "Failed to delete owned resources during Removed state cleanup")
+			return ctrl.Result{}, err
 		}
 		cm.MarkNotConfigured(conditions.ConditionMonitoringDependenciesReady, "Removed", "Monitoring is in Removed state")
 		cm.MarkNotConfigured(conditions.ConditionMonitoringAvailable, "Removed", "Monitoring is in Removed state")
@@ -270,6 +272,9 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// Build template data.
 	data, err := buildTemplateData(ctx, r.Client, monitoring, persesVersion)
 	if err != nil {
+		if errors.Is(err, errProxyTLSResolutionFailed) {
+			return ctrl.Result{}, err
+		}
 		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "ConfigurationError", err.Error())
 		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ConfigurationError", err.Error())
 		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
@@ -310,7 +315,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	// Garbage-collect stale owned resources via API discovery.
 	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
-		log.Error(err, "Garbage collection encountered errors")
+		return ctrl.Result{}, fmt.Errorf("collecting stale owned resources: %w", err)
 	}
 
 	r.syncPostDeployResources(ctx, monitoring, cm)
@@ -475,12 +480,13 @@ func (r *MonitoringReconciler) preparePrometheusWebTLSCA(
 ) (bool, error) {
 	stackFound := false
 	var caConfigMap *unstructured.Unstructured
+	namespace := monitoringNamespace(monitoring)
 	for i := range desired {
 		obj := &desired[i]
-		if obj.GroupVersionKind() == controllergvk.MonitoringStack && obj.GetNamespace() == monitoring.Spec.Namespace {
+		if obj.GroupVersionKind() == controllergvk.MonitoringStack && obj.GetNamespace() == namespace {
 			stackFound = true
 		}
-		if obj.GroupVersionKind() == controllergvk.ConfigMap && obj.GetNamespace() == monitoring.Spec.Namespace && obj.GetName() == prometheusWebTLSCAConfigMapName {
+		if obj.GroupVersionKind() == controllergvk.ConfigMap && obj.GetNamespace() == namespace && obj.GetName() == prometheusWebTLSCAConfigMapName {
 			caConfigMap = obj
 		}
 	}
@@ -540,9 +546,7 @@ type resourceKey struct {
 
 // collectGarbage deletes owned resources not in the desired set using API discovery.
 func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v1alpha1.Monitoring, desired []unstructured.Unstructured) error {
-	if monitoring.Spec.Namespace == "" {
-		return errors.New("monitoring.Spec.Namespace is empty, cannot safely perform garbage collection")
-	}
+	namespace := monitoringNamespace(monitoring)
 
 	desiredSet := make(map[resourceKey]struct{}, len(desired))
 	for i := range desired {
@@ -556,10 +560,10 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 
 	collector := gc.New(
 		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
-		gc.InNamespace(monitoring.Spec.Namespace),
+		gc.InNamespace(namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
-			return shouldCollectOwnedResource(monitoring, obj, desiredSet, monitoring.Spec.Namespace), nil
+			return shouldCollectOwnedResource(monitoring, obj, desiredSet, namespace), nil
 		}),
 	)
 
@@ -575,21 +579,19 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		return err
 	}
 
-	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet, monitoring.Spec.Namespace)
+	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet, namespace)
 }
 
 // deleteAllOwned removes all resources owned by this controller (used on Removed state).
 func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v1alpha1.Monitoring) error {
-	if monitoring.Spec.Namespace == "" {
-		return errors.New("monitoring.Spec.Namespace is empty, cannot safely delete owned resources")
-	}
+	namespace := monitoringNamespace(monitoring)
 
 	collector := gc.New(
 		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
-		gc.InNamespace(monitoring.Spec.Namespace),
+		gc.InNamespace(namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
-			return isOwnedByMonitoring(monitoring, &obj) && isInMonitoringScope(&obj, monitoring.Spec.Namespace), nil
+			return isOwnedByMonitoring(monitoring, &obj) && isInMonitoringScope(&obj, namespace), nil
 		}),
 	)
 
@@ -605,7 +607,7 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		return err
 	}
 
-	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil, monitoring.Spec.Namespace)
+	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil, namespace)
 }
 
 func (r *MonitoringReconciler) collectTargetAllocatorRBACGarbage(

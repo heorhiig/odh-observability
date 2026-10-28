@@ -266,6 +266,77 @@ func TestSyncPrometheusWebTLSCA_NoMetrics(t *testing.T) {
 	}
 }
 
+func TestSyncHelpersUseConfiguredMonitoringNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "custom-monitoring")
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	configMap := &unstructured.Unstructured{}
+	configMap.SetAPIVersion("v1")
+	configMap.SetKind("ConfigMap")
+	configMap.SetNamespace("custom-monitoring")
+	configMap.SetName(prometheusWebTLSCAConfigMapName)
+	_ = unstructured.SetNestedStringMap(configMap.Object, map[string]string{
+		serviceCACertificateKey: "test-ca",
+	}, "data")
+
+	route := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      thanosQuerierRouteName,
+			Namespace: "custom-monitoring",
+		},
+		Spec: routev1.RouteSpec{
+			TLS: &routev1.TLSConfig{
+				Termination: routev1.TLSTerminationReencrypt,
+			},
+		},
+		Status: routev1.RouteStatus{
+			Ingress: []routev1.RouteIngress{{Host: "thanos.example.com"}},
+		},
+	}
+
+	s := newTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(configMap, route).
+		WithStatusSubresource(route).
+		Build()
+
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("syncPrometheusWebTLSCA: ready=%v error=%v", ready, err)
+	}
+	var secret corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{
+		Namespace: "custom-monitoring",
+		Name:      prometheusWebTLSCAConfigMapName,
+	}, &secret); err != nil {
+		t.Fatalf("CA Secret was not synchronized in the configured namespace: %v", err)
+	}
+
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+		t.Fatalf("syncThanosQuerierRouteDestinationCA: %v", err)
+	}
+	if err := cli.Get(context.Background(), types.NamespacedName{
+		Namespace: "custom-monitoring",
+		Name:      thanosQuerierRouteName,
+	}, route); err != nil {
+		t.Fatalf("Thanos route was not found in the configured namespace: %v", err)
+	}
+	if route.Spec.TLS.DestinationCACertificate != "test-ca" {
+		t.Fatalf("Thanos route CA mismatch: got %q", route.Spec.TLS.DestinationCACertificate)
+	}
+
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("syncStatusURL: %v", err)
+	}
+	if m.Status.URL != "https://thanos.example.com" {
+		t.Fatalf("status URL mismatch: got %q", m.Status.URL)
+	}
+}
+
 func TestSyncPrometheusWebTLSCA_ConfigMapMissing(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)

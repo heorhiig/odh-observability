@@ -71,6 +71,31 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 	}
 }
 
+func TestOwnedServiceMonitorsCarryScrapeLabel(t *testing.T) {
+	collectorResources := renderObservabilityTemplate(t, CollectorServiceMonitorsTemplate, map[string]any{
+		"Namespace": "redhat-ods-monitoring",
+		"Metrics":   true,
+	})
+	for _, name := range []string{"data-science-collector-monitor", "data-science-prometheus-monitor"} {
+		serviceMonitor := findRenderedResource(t, collectorResources, "ServiceMonitor", name)
+		assertScrapeLabel(t, serviceMonitor)
+	}
+
+	prometheusResources := renderObservabilityTemplate(t, PrometheusSelfServiceMonitorTemplate, map[string]any{
+		"Namespace": "redhat-ods-monitoring",
+	})
+	assertScrapeLabel(t, findRenderedResource(t, prometheusResources, "ServiceMonitor", "prometheus-self-fixed"))
+}
+
+func assertScrapeLabel(t *testing.T, serviceMonitor unstructured.Unstructured) {
+	t.Helper()
+	value, found, err := unstructured.NestedString(serviceMonitor.Object, "metadata", "labels", "monitoring.opendatahub.io/scrape")
+	if err != nil || !found || value != "true" {
+		t.Fatalf("ServiceMonitor %q must carry monitoring.opendatahub.io/scrape=true: found=%t value=%q error=%v",
+			serviceMonitor.GetName(), found, value, err)
+	}
+}
+
 // TestCollectorServiceMonitorsOmitPrometheusMonitorWithoutMetrics ensures the
 // user-workload ServiceMonitor is gated on metrics.storage.
 func TestCollectorServiceMonitorsOmitPrometheusMonitorWithoutMetrics(t *testing.T) {

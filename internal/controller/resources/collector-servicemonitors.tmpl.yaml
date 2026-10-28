@@ -4,6 +4,8 @@ kind: ServiceMonitor
 metadata:
   name: data-science-collector-monitor
   namespace: {{.Namespace}}
+  labels:
+    monitoring.opendatahub.io/scrape: "true"
 spec:
   endpoints:
   - port: monitoring
@@ -32,6 +34,8 @@ kind: ServiceMonitor
 metadata:
   name: data-science-prometheus-monitor
   namespace: {{.Namespace}}
+  labels:
+    monitoring.opendatahub.io/scrape: "true"
 spec:
   endpoints:
     - port: prometheus

@@ -87,7 +87,7 @@ spec:
             namespace: "{{ .OperatorNamespace }}"
           annotations:
             summary: "Monitoring operator pod is unavailable"
-            description: "No ready operator pod in {{ .OperatorNamespace }} for 5 minutes. Webhook unavailable. Impact: failurePolicy=Ignore (default) admits monitors without scrape label (not scraped); Fail blocks admission."
+            description: "No ready operator pod in {{ .OperatorNamespace }} for 5 minutes. Webhook unavailable. Impact: failurePolicy=Fail (default) blocks admission; Ignore admits monitors without scrape label (not scraped)."
             triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#monitoring-operator-pod-unavailable"
 
         - alert: MonitoringWebhookAdmissionErrors
@@ -127,5 +127,5 @@ spec:
             namespace: "{{ .OperatorNamespace }}"
           annotations:
             summary: "Webhook admission path is down"
-            description: "Webhook admission probe has failed for 15+ minutes. Check webhook pod logs, Service, TLS cert, MutatingWebhookConfiguration. Impact: failurePolicy=Ignore (default) admits monitors without scrape label (not scraped); Fail blocks admission."
+            description: "Webhook admission probe has failed for 15+ minutes. Check webhook pod logs, Service, TLS cert, MutatingWebhookConfiguration. Impact: failurePolicy=Fail (default) blocks admission; Ignore admits monitors without scrape label (not scraped)."
             triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#monitoring-webhook-admission-path-down"

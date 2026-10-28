@@ -339,10 +339,10 @@ result=$?
 set -e
 printf 'missing client certificate: connection=%%s curl=%%s\n' "$connection" "$result"
 test "$connection" = 1:000
-# Curl/OpenSSL versions report an mTLS rejection as 16 (SSL_write broken
-# pipe), 35 (TLS connect), or 56 (recv failure). In each case the TCP
-# connection succeeded but the server returned no HTTP response.
-test "$result" -eq 16 -o "$result" -eq 35 -o "$result" -eq 56
+# Curl versions can surface an mTLS rejection as 16 (HTTP/2 framing),
+# 35 (TLS handshake), 55 (send failure/broken pipe), or 56 (recv failure).
+# In each case the TCP connection succeeded without an HTTP response.
+test "$result" -eq 16 -o "$result" -eq 35 -o "$result" -eq 55 -o "$result" -eq 56
 `, endpoint, endpoint)}
 		})
 	tc.runNetworkPolicyProbe(t, "targetallocator-mtls-untrusted-denied", tc.MonitoringNamespace,

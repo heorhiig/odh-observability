@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	configv1 "github.com/openshift/api/config/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -17,6 +18,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -63,7 +65,15 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 		return nil, fmt.Errorf("error creating the config object: %w", err)
 	}
 
-	ctrlCli, err := client.New(cfg, client.Options{})
+	scheme := k8sruntime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to register Kubernetes API types: %w", err)
+	}
+	if err := configv1.Install(scheme); err != nil {
+		return nil, fmt.Errorf("failed to register OpenShift config API types: %w", err)
+	}
+
+	ctrlCli, err := client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize client: %w", err)
 	}
@@ -685,6 +695,23 @@ func (tc *TestContext) ensureOperatorDeploymentReady(t *testing.T) string {
 	}).WithTimeout(5*time.Minute).Should(Succeed(),
 		"odh-observability operator must be deployed before monitoring e2e tests")
 	return monitoringNamespace
+}
+
+// operatorDeploymentNamespace is the namespace of the odh-observability
+// Deployment. The metrics Service is created there. It is not
+// MONITORING_NAMESPACE, which ensureOperatorDeploymentReady returns and which
+// is where the MonitoringStack Prometheus runs.
+func (tc *TestContext) operatorDeploymentNamespace(t *testing.T) string {
+	t.Helper()
+
+	deployments := &appsv1.DeploymentList{}
+	if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+		t.Fatalf("listing odh-observability Deployments: %v", err)
+	}
+	if len(deployments.Items) != 1 {
+		t.Fatalf("expected one odh-observability Deployment, found %d", len(deployments.Items))
+	}
+	return deployments.Items[0].Namespace
 }
 
 // ensureCRDExists verifies that a CRD is registered on the cluster and fails
