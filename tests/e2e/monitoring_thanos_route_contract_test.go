@@ -198,10 +198,10 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 
 	// The Thanos proxy fronts prom-label-proxy with the read-only method gate, so
 	// every POST is rejected with 403 before prom-label-proxy can ParseForm and
-	// merge a body "namespace" into the enforced label matcher. Prove the gate
-	// closes the POST-body bypass regardless of the caller's RBAC: the authorized
-	// token here is granted "create" on pods.metrics.k8s.io (see postRole above),
-	// so only the gate — not kube-rbac-proxy — can be rejecting the request.
+	// merge a body "namespace" into the enforced label matcher. metricsRole grants
+	// only "get" on pods.metrics.k8s.io, and the Thanos template sets a static
+	// resourceAttributes.verb: get, so kube-rbac-proxy authorizes this POST; only
+	// the method gate can reject it.
 	assertThanosPostRejectedByMethodGate(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
 
 	// A POST that also tries to smuggle a second namespace in the form body must

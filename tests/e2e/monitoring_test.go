@@ -1,8 +1,11 @@
 package e2e_test
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +21,7 @@ import (
 	ocpcrypto "github.com/openshift/library-go/pkg/crypto"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -25,6 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
+	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -2526,6 +2534,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
 		t.Run("Namespace isolation POST form bypass", tc.ValidateNamespaceIsolationPostFormBypass)
+		t.Run("Operator metrics authentication and authorization", tc.ValidateOperatorMetricsAuthenticationAndAuthorization)
 		t.Run("Operand NetworkPolicies and lifecycle", tc.ValidateOperandNetworkPolicies)
 		t.Run("Collector and TargetAllocator NetworkPolicy contract", tc.ValidateCollectorNetworkPolicyContract)
 		t.Run("Collector OTLP namespace authorization", tc.ValidateCollectorOTLPNamespaceBoundary)
@@ -3085,7 +3094,7 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 
 	tc.EnsureResourceDoesNotExist(
 		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{Name: "data-science-metrics-view"}),
-		WithCustomErrorMsg("ClusterRole 'data-science-metrics-view' must not exist: granting 'create' on metrics.k8s.io/pods authorizes POST and enables a POST-body namespace bypass"),
+		WithCustomErrorMsg("ClusterRole 'data-science-metrics-view' must not exist"),
 	)
 
 	tc.EnsureResourceExists(
@@ -3104,40 +3113,306 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 		WithCustomErrorMsg("namespace proxy must have the method gate and route kube-rbac-proxy through it"),
 	)
 
-	t.Log("POST-body namespace bypass is closed: the method gate rejects non-GET/HEAD (403) before prom-label-proxy, independent of RBAC")
+	t.Log("POST-body namespace bypass is closed: the method gate rejects non-GET/HEAD (403) before prom-label-proxy")
 
 	host := tc.routeHost(t, "data-science-prometheus-route")
 	rootCAs := clusterIngressCAPool(t, tc)
 
-	// Behavioral proof #1 (RBAC layer): a token authorized only for GET (verb "get")
-	// on pods.metrics.k8s.io issues a POST with the namespace in both the URL query
-	// (allowed) and the form body ("secret"). POST maps to the "create" verb, which
-	// the token lacks, so kube-rbac-proxy rejects it with 403.
-	getOnlyToken := tc.mintScopedMetricsGetToken(t, tc.MonitoringNamespace)
-
-	// Behavioral proof #2 (method gate, independent of RBAC): a token authorized for
-	// "create" on pods.metrics.k8s.io in the URL-query namespace. kube-rbac-proxy maps
-	// POST -> create and WOULD authorize this POST, so the only thing that can reject it
-	// is the method gate. Asserting 403 proves the gate enforces GET/HEAD regardless of
-	// RBAC grants. Minted explicitly (not the optional admin token) so the check is
-	// deterministic and never silently skipped.
-	createToken := tc.mintScopedMetricsCreateToken(t, tc.MonitoringNamespace)
+	// Token authorized for "get" on pods.metrics.k8s.io. The proxy ConfigMap uses a
+	// static resourceAttributes.verb: get, so kube-rbac-proxy authorizes this POST;
+	// only the method gate can reject it. Asserting the gate body proves the 403 is
+	// not from kube-rbac-proxy.
+	getToken := tc.mintScopedMetricsGetToken(t, tc.MonitoringNamespace)
 
 	g := NewWithT(t)
 	g.Eventually(func(g Gomega) {
-		status, _, err := postPromQLForm(tc.Context(), rootCAs, host, getOnlyToken, tc.MonitoringNamespace, "openshift-monitoring")
+		status, body, err := postPromQLForm(tc.Context(), rootCAs, host, getToken, tc.MonitoringNamespace, "openshift-monitoring")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(status).To(Equal(http.StatusForbidden),
-			"POST with a get-only token must be rejected with 403; got %d", status)
-	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
-
-	g.Eventually(func(g Gomega) {
-		status, body, err := postPromQLForm(tc.Context(), rootCAs, host, createToken, tc.MonitoringNamespace, "openshift-monitoring")
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(status).To(Equal(http.StatusForbidden),
-			"POST with a create-capable token must still be rejected with 403 by the method gate; got %d", status)
+			"POST with a get-authorized token must be rejected with 403 by the method gate; got %d", status)
 		g.Expect(body).To(ContainSubstring("only GET and HEAD are allowed"))
 	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+}
+
+func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorization(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.verifyOperatorMetricsRBAC(t)
+
+	// The suite creates this ServiceMonitor during module-mode setup only.
+	// DSC runs the same test, and the chart leaves the CA out unless
+	// metrics.serviceMonitor.enabled is set, so create it here for both modes.
+	tc.ensureOperatorServiceMonitor(t)
+
+	// ensureOperatorDeploymentReady returns MONITORING_NAMESPACE. The metrics
+	// Service and its DNS name live in the operator Deployment namespace.
+	// NetworkPolicy accepts :8443 only from the monitoring namespace, so the
+	// probe has to run in a pod there rather than in the test process.
+	monitoringNS := tc.ensureOperatorDeploymentReady(t)
+	operatorNS := tc.operatorDeploymentNamespace(t)
+	serviceHost := fmt.Sprintf("odh-observability-metrics.%s.svc:8443", operatorNS)
+	tc.waitForOperatorMetricsCA(t, monitoringNS)
+	tc.ensureOperatorMetricsProbePod(t, monitoringNS)
+
+	t.Run("Unauthenticated request returns 401", func(t *testing.T) {
+		statusCode := tc.probeOperatorMetrics(t, monitoringNS, serviceHost, "")
+		if statusCode != http.StatusUnauthorized {
+			t.Errorf("unauthenticated request to /metrics should return 401, got %d", statusCode)
+		}
+	})
+
+	t.Run("Unauthorized request returns 403", func(t *testing.T) {
+		unauthorizedSA := tc.createServiceAccountForMetricsTest(t, operatorNS, "metrics-unauthorized-test")
+		unauthorizedToken := tc.getServiceAccountToken(t, operatorNS, unauthorizedSA)
+
+		statusCode := tc.probeOperatorMetrics(t, monitoringNS, serviceHost, unauthorizedToken)
+		if statusCode != http.StatusForbidden {
+			t.Errorf("unauthorized request to /metrics should return 403, got %d", statusCode)
+		}
+	})
+
+	t.Run("Authorized request returns 200", func(t *testing.T) {
+		prometheusSA := fmt.Sprintf("%s-prometheus", MonitoringStackName)
+		tokenNamespace := tc.MonitoringNamespace
+		if tokenNamespace == "" {
+			tokenNamespace = monitoringNS
+		}
+		authorizedToken := tc.getServiceAccountToken(t, tokenNamespace, prometheusSA)
+
+		var statusCode int
+		tc.g.Eventually(func() error {
+			statusCode = tc.probeOperatorMetrics(t, monitoringNS, serviceHost, authorizedToken)
+			if statusCode != http.StatusOK {
+				return fmt.Errorf("authorized request to /metrics should return 200, got %d", statusCode)
+			}
+			return nil
+		}).WithTimeout(30*time.Second).Should(Succeed(),
+			"Prometheus ServiceAccount should be able to scrape operator metrics")
+	})
+}
+
+func (tc *MonitoringTestCtx) verifyOperatorMetricsRBAC(t *testing.T) {
+	t.Helper()
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithCondition(And(
+			jq.Match(`[.rules[] | select(.nonResourceURLs[]? == "/metrics")] | any`),
+			jq.Match(`[.rules[] | select(.verbs[]? == "get")] | any`),
+		)),
+		WithCustomErrorMsg("ClusterRole odh-observability-metrics-reader should grant GET on /metrics"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "odh-observability-metrics-reader"`),
+			jq.Match(`[.subjects[] | select(.kind == "ServiceAccount" and .name == "%s")] | any`, fmt.Sprintf("%s-prometheus", MonitoringStackName)),
+			jq.Match(`[.subjects[] | select(.namespace == "%s")] | any`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind Prometheus SA to metrics-reader role"),
+	)
+
+	t.Logf("Operator metrics RBAC resources verified")
+}
+
+func (tc *MonitoringTestCtx) createServiceAccountForMetricsTest(t *testing.T, namespace, name string) string {
+	t.Helper()
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+	if err := tc.Client().Create(tc.Context(), sa); err != nil && !k8serr.IsAlreadyExists(err) {
+		t.Fatalf("failed to create test ServiceAccount %s/%s: %v", namespace, name, err)
+	}
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), sa); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("failed to clean up test ServiceAccount %s/%s: %v", namespace, name, err)
+		}
+	})
+	return name
+}
+
+func (tc *MonitoringTestCtx) getServiceAccountToken(t *testing.T, namespace, serviceAccountName string) string {
+	t.Helper()
+
+	config, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Fatalf("failed to load Kubernetes config for token: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatalf("failed to create Kubernetes client for token: %v", err)
+	}
+
+	tokenRequest, err := clientset.CoreV1().ServiceAccounts(namespace).CreateToken(
+		tc.Context(),
+		serviceAccountName,
+		&authenticationv1.TokenRequest{},
+		metav1.CreateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("failed to create token for ServiceAccount %s/%s: %v", namespace, serviceAccountName, err)
+	}
+	if tokenRequest.Status.Token == "" {
+		t.Fatalf("TokenRequest for ServiceAccount %s/%s returned empty token", namespace, serviceAccountName)
+	}
+	return tokenRequest.Status.Token
+}
+
+const (
+	operatorMetricsProbePodName = "operator-metrics-auth-probe"
+	operatorMetricsCAConfigMap  = "odh-observability-metrics-ca"
+)
+
+func (tc *MonitoringTestCtx) waitForOperatorMetricsCA(t *testing.T, monitoringNS string) {
+	t.Helper()
+
+	tc.g.Eventually(func() error {
+		caConfigMap := &corev1.ConfigMap{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      operatorMetricsCAConfigMap,
+			Namespace: monitoringNS,
+		}, caConfigMap); err != nil {
+			return err
+		}
+		if caConfigMap.Data["service-ca.crt"] == "" {
+			return fmt.Errorf("service-ca.crt is not injected into %s/%s yet", monitoringNS, operatorMetricsCAConfigMap)
+		}
+		return nil
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"operator metrics CA ConfigMap should exist in the monitoring namespace")
+}
+
+func (tc *MonitoringTestCtx) ensureOperatorMetricsProbePod(t *testing.T, monitoringNS string) {
+	t.Helper()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      operatorMetricsProbePodName,
+			Namespace: monitoringNS,
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:   corev1.RestartPolicyAlways,
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "curl",
+				Image:           fakeGCSClientImage,
+				ImagePullPolicy: corev1.PullIfNotPresent,
+				Command:         []string{"sleep", "3600"},
+				SecurityContext: fixtureContainerSecurityContext(),
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "metrics-ca",
+					MountPath: "/ca",
+					ReadOnly:  true,
+				}},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "metrics-ca",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: operatorMetricsCAConfigMap},
+					},
+				},
+			}},
+		},
+	}
+	if err := tc.Client().Create(tc.Context(), pod); err != nil && !k8serr.IsAlreadyExists(err) {
+		t.Fatalf("failed to create operator metrics probe pod: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), pod); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("failed to delete operator metrics probe pod: %v", err)
+		}
+	})
+
+	tc.g.Eventually(func() error {
+		current := &corev1.Pod{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      operatorMetricsProbePodName,
+			Namespace: monitoringNS,
+		}, current); err != nil {
+			return err
+		}
+		if current.Status.Phase != corev1.PodRunning {
+			return fmt.Errorf("probe pod is %s", current.Status.Phase)
+		}
+		for _, container := range current.Status.ContainerStatuses {
+			if container.Name == "curl" && container.Ready {
+				return nil
+			}
+		}
+		return errors.New("curl container is not ready")
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"operator metrics probe pod should be running in the monitoring namespace")
+}
+
+func (tc *MonitoringTestCtx) probeOperatorMetrics(t *testing.T, monitoringNS, serviceHost, token string) int {
+	t.Helper()
+
+	args := []string{
+		"curl", "--noproxy", "*", "-sS",
+		"--connect-timeout", "5", "--max-time", "10",
+		"--cacert", "/ca/service-ca.crt",
+		"-o", "/dev/null", "-w", "%{http_code}",
+	}
+	if token != "" {
+		args = append(args, "-H", "Authorization: Bearer "+token)
+	}
+	args = append(args, "https://"+serviceHost+"/metrics")
+
+	stdout, stderr, err := tc.execOperatorMetricsProbe(t, monitoringNS, args)
+	statusCode, convErr := strconv.Atoi(strings.TrimSpace(stdout))
+	if err != nil || convErr != nil || statusCode == 0 {
+		t.Logf("operator metrics probe from %s/%s failed: status=%q err=%v stderr=%s",
+			monitoringNS, operatorMetricsProbePodName, strings.TrimSpace(stdout), err, strings.TrimSpace(stderr))
+		return 0
+	}
+	t.Logf("operator metrics probe from %s: status=%d", monitoringNS, statusCode)
+	return statusCode
+}
+
+func (tc *MonitoringTestCtx) execOperatorMetricsProbe(t *testing.T, monitoringNS string, command []string) (string, string, error) {
+	t.Helper()
+
+	cfg, err := ctrlcfg.GetConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("load kubeconfig for pod exec: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes client for pod exec: %w", err)
+	}
+	request := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").Name(operatorMetricsProbePodName).
+		Namespace(monitoringNS).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "curl",
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, clientgoscheme.ParameterCodec)
+	executor, err := remotecommand.NewSPDYExecutor(cfg, http.MethodPost, request.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes pod exec stream: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), 30*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
 }
 
 // ========================================================================

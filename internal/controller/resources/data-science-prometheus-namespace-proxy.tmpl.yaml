@@ -82,8 +82,9 @@ data:
       resourceAttributes:
         apiGroup: metrics.k8s.io
         resource: pods
-        # Perses sends read-only queries with POST. Authorize the requested
-        # namespace with the existing metrics read permission for both methods.
+        # Static verb: every request, including POST, is authorized as "get" on
+        # the URL-query namespace. The method-gate sidecar rejects non-GET/HEAD
+        # with 403 before prom-label-proxy.
         verb: get
         namespace: "{{ "{{ .Value }}" }}"
 ---

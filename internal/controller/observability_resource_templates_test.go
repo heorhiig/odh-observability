@@ -702,14 +702,10 @@ func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyTemplate, proxyTemplateData())
 
-	// The template must NOT grant users "create" on metrics.k8s.io/pods. kube-rbac-proxy
-	// maps POST -> "create", so any such grant would authorize POST requests, and
-	// prom-label-proxy's --query-param (ParseForm) would then merge a POST-body
-	// "namespace" into the enforced matcher, bypassing tenant isolation. The proxy is
-	// GET-only; POST is rejected at the authorization layer.
+	// The template must not aggregate extra metrics permissions into view/edit/admin.
 	for _, resource := range resources {
 		if resource.GetKind() == "ClusterRole" && resource.GetName() == "data-science-metrics-view" {
-			t.Fatalf("template must not render the data-science-metrics-view ClusterRole: granting create on metrics.k8s.io/pods authorizes POST and enables a POST-body namespace bypass")
+			t.Fatal("namespace proxy must not aggregate extra permissions into view/edit/admin")
 		}
 	}
 
