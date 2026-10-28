@@ -166,7 +166,9 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	addResourceData(templateData)
-	addImageURLs(templateData)
+	if err := addImageURLs(templateData); err != nil {
+		return nil, err
+	}
 
 	if err := addTLSData(ctx, c, templateData); err != nil {
 		return nil, err
@@ -603,7 +605,7 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 	return nil
 }
 
-func addImageURLs(templateData map[string]any) {
+func addImageURLs(templateData map[string]any) error {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
 		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:f9cad8a1389ba747f412620525328ccebda1409eab55ea80e4818349b37cbdeb",
@@ -613,17 +615,16 @@ func addImageURLs(templateData map[string]any) {
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
 	// HTTPMethodGateImage runs the "method-gate" subcommand of this operator binary
-	// as a sidecar: a minimal reverse proxy that rejects any method other than
-	// GET/HEAD before the request reaches prom-label-proxy. This enforces read-only
-	// access at the proxy layer independent of RBAC, so a POST-body "namespace" value
-	// can never be merged into the enforced label matcher even if a role were ever to
-	// grant "create" on metrics.k8s.io/pods. Reusing the operator image means no extra
-	// image has to be shipped or mirrored for disconnected installs; OPERATOR_IMAGE is
-	// set on the operator Deployment to the operator's own (pinned, mirrored) image.
-	templateData["HTTPMethodGateImage"] = getEnvOrDefault(
-		"OPERATOR_IMAGE",
-		"quay.io/opendatahub/odh-observability@sha256:e18a0beefbe02c535c0acf277a17f8c37302de94bfb70f7e2d713f2689b18498",
-	)
+	// as a sidecar. There is no digest fallback: an image built before that
+	// subcommand treats "method-gate" as a non-flag and starts the manager,
+	// which never listens on :9092. OPERATOR_IMAGE is set on the operator
+	// Deployment to the operator's own image.
+	image := os.Getenv("OPERATOR_IMAGE")
+	if image == "" {
+		return fmt.Errorf("OPERATOR_IMAGE is empty: the method-gate sidecar must use this operator image")
+	}
+	templateData["HTTPMethodGateImage"] = image
+	return nil
 }
 
 // getKorrel8rImage returns the pinned Korrel8r image, allowing release
