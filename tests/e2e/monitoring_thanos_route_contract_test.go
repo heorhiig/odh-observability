@@ -191,9 +191,10 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	assertThanosRouteNamespaceSeries(t, "crafted selector", crafted.Labels, tc.MonitoringNamespace)
 
 	// POST cases are stopped by the method gate before prom-label-proxy, so they
-	// no longer exercise the GET single-value / --regex-match guard. Two
-	// namespace query values must not leak series from the second namespace:
-	// with --regex-match, prom-label-proxy rejects multiple values with 400.
+	// no longer exercise the GET single-value guard. Two namespace query values
+	// must not leak series from the second namespace. kube-rbac-proxy may 403 on
+	// the unauthorized second value; if the request reaches prom-label-proxy,
+	// --regex-match rejects multiple values with 400.
 	const secondNamespace = "kube-system"
 	dualNamespace, err := probeThanosRouteWithNamespaces(
 		rootCAs,
@@ -211,8 +212,8 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 			t.Fatalf("GET with two namespace query values must not return series from %q", secondNamespace)
 		}
 	}
-	if dualNamespace.HTTPStatus != http.StatusBadRequest {
-		t.Fatalf("GET with two namespace query values must be rejected with 400 by the single-value/--regex-match guard, got http_status=%d", dualNamespace.HTTPStatus)
+	if dualNamespace.HTTPStatus != http.StatusBadRequest && dualNamespace.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("GET with two namespace query values must be rejected (400 from prom-label-proxy or 403 from kube-rbac-proxy), got http_status=%d", dualNamespace.HTTPStatus)
 	}
 
 	// The Thanos proxy fronts prom-label-proxy with the read-only method gate, so
