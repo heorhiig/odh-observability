@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"crypto/x509"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
