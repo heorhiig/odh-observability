@@ -88,6 +88,10 @@ const (
 
 	persesV1Alpha2 = "v1alpha2"
 
+	// defaultLokiStackSize is the size used when usageLogs.size is unset. It matches
+	// what shipped before the field existed, so an unset spec is unchanged.
+	defaultLokiStackSize = "1x.extra-small"
+
 	// Security limits for exporter configurations.
 	maxConfigFields      = 50    // Maximum number of fields in an exporter config.
 	maxNestingDepth      = 10    // Maximum nesting depth to prevent deeply nested objects.
@@ -138,11 +142,12 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	templateData := map[string]any{
-		"Namespace":        monitoringNamespace,
-		"GatewayNamespace": gatewayNamespace,
-		"Traces":           monitoring.Spec.Traces != nil,
-		"Metrics":          monitoring.Spec.Metrics != nil,
-		"MetricsStorage":   monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		"Namespace":                monitoringNamespace,
+		"GatewayNamespace":         gatewayNamespace,
+		"Traces":                   monitoring.Spec.Traces != nil,
+		"Metrics":                  monitoring.Spec.Metrics != nil,
+		"MetricsStorage":           monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		"BuiltinDCGMScrapeEnabled": builtinDCGMScrapeEnabled(monitoring.Spec.Metrics),
 		// Always set: templates use missingkey=error; metrics-only never calls addTracesTemplateData.
 		"TempoStorage":                    false,
 		"Logs":                            monitoring.Spec.Logs != nil,
@@ -154,6 +159,11 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"MetricsExporterNames":            []string{},
 		"TracesExporters":                 make(map[string]string),
 		"TracesExporterNames":             []string{},
+		"UsageLogsExporters":              make(map[string]string),
+		"UsageLogsExporterNames":          []string{},
+		"UsageLogsCredentialSecret":       "",
+		"UsageLogsAttributes":             make(map[string]string),
+		"UsageLogsAttributeNames":         []string{},
 		"PersesImage":                     getPersesImage(),
 		"PersesAPIVersion":                persesAPIVersion,
 		"Korrel8rImage":                   getKorrel8rImage(),
@@ -220,15 +230,8 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		templateData["LokiStorageClassName"] = ""
 	}
 
-	// Usage logs collector configuration (independent of Loki storage resolution)
-	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
-	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", lokiStackName, monitoringNamespace)
-		templateData["UsageLogs"] = true
-		templateData["UsageLogsEndpoint"] = gatewayURL
-	} else {
-		templateData["UsageLogs"] = false
-		templateData["UsageLogsEndpoint"] = ""
+	if err := addUsageLogsData(monitoring, lokiStackName, monitoringNamespace, templateData); err != nil {
+		return nil, err
 	}
 
 	// Cluster log forwarding configuration
@@ -372,8 +375,13 @@ func kubernetesAPIServerCIDRs(endpointSlices []discoveryv1.EndpointSlice) ([]str
 func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
 	var allErrors *multierror.Error
 
-	usageLogsConfigured := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
-	needsLoki := monitoring.Spec.Logs != nil || usageLogsConfigured
+	// Two different questions. Loki is needed only for a cluster-local store, so a
+	// cluster that just forwards needs no Loki operator at all. The collector is needed
+	// for either write, so forwarding alone still requires the OpenTelemetry operator.
+	usageLogs := monitoring.Spec.UsageLogs
+	usageLogsStorage := usageLogs != nil && usageLogs.Storage != nil
+	usageLogsCollector := usageLogs != nil && (usageLogs.Storage != nil || len(usageLogs.Exporters) > 0)
+	needsLoki := monitoring.Spec.Logs != nil || usageLogsStorage
 
 	checkOperatorNames := func(names []string, missingMessage string) error {
 		for _, name := range names {
@@ -394,7 +402,7 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		return checkOperatorNames([]string{name}, missingMessage)
 	}
 
-	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsConfigured {
+	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsCollector {
 		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
 			return err
 		}
@@ -442,6 +450,10 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		return &missingOperatorsError{err: err}
 	}
 	return nil
+}
+
+func builtinDCGMScrapeEnabled(metrics *v1alpha1.Metrics) bool {
+	return metrics != nil && (metrics.BuiltinDCGMScrapeEnabled == nil || *metrics.BuiltinDCGMScrapeEnabled)
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {
@@ -525,6 +537,87 @@ func addExportersData(metrics *v1alpha1.Metrics, templateData map[string]any) er
 
 	templateData["MetricsExporters"] = validatedExporters
 	templateData["MetricsExporterNames"] = exporterNames
+
+	return nil
+}
+
+// addUsageLogsData resolves everything the usage-log collector renders from: the LokiStack
+// size that governs the shared stack, whether the cluster-local write is configured and the
+// endpoint it uses, and the remote exporters alongside it. Kept out of buildTemplateData so
+// that function stays under the cyclomatic complexity limit.
+func addUsageLogsData(monitoring *v1alpha1.Monitoring, lokiStackName, monitoringNamespace string, templateData map[string]any) error {
+	usageLogs := monitoring.Spec.UsageLogs
+
+	// LokiStack size. One stack currently serves both cluster log forwarding and usage
+	// logs, so the usage-log size governs it; when the two stacks split this follows
+	// the usage stack. Unset means the shipped default.
+	lokiStackSize := defaultLokiStackSize
+	if usageLogs != nil && usageLogs.Size != "" {
+		lokiStackSize = usageLogs.Size
+	}
+	templateData["LokiStackSize"] = lokiStackSize
+
+	// Independent of the Loki storage resolution above: the collector is named whether or
+	// not it is configured, because the reconciler looks it up either way.
+	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
+
+	if usageLogs == nil {
+		templateData["UsageLogs"] = false
+		templateData["UsageLogsEndpoint"] = ""
+		return nil
+	}
+
+	// The two writes are configured independently: storage drives the cluster-local
+	// pipeline, exporters drive the forwarding one, and a cluster may have either or
+	// both. So UsageLogs says only whether a local store exists, and the exporters are
+	// resolved below either way — a cluster that only forwards still has to render them.
+	if usageLogs.Storage != nil {
+		templateData["UsageLogs"] = true
+		templateData["UsageLogsEndpoint"] = fmt.Sprintf(
+			"https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp",
+			lokiStackName, monitoringNamespace,
+		)
+	} else {
+		templateData["UsageLogs"] = false
+		templateData["UsageLogsEndpoint"] = ""
+	}
+
+	return addUsageLogsExportersData(usageLogs, templateData)
+}
+
+// addUsageLogsExportersData validates the usage-log exporters and the resource
+// attributes stamped alongside them. Both feed the remote pipeline only, so the
+// spoke-local write keeps the record shape its dashboards and tenancy proxy expect.
+func addUsageLogsExportersData(usageLogs *v1alpha1.UsageLogs, templateData map[string]any) error {
+	validatedExporters := make(map[string]string)
+	exporterNames := make([]string, 0)
+
+	if len(usageLogs.Exporters) > 0 {
+		var err error
+		validatedExporters, err = validateExporters(usageLogs.Exporters)
+		if err != nil {
+			return fmt.Errorf("%w: %w", errUsageLogsExporterInvalid, err)
+		}
+
+		for name := range validatedExporters {
+			exporterNames = append(exporterNames, name)
+		}
+		sort.Strings(exporterNames)
+	}
+
+	templateData["UsageLogsExporters"] = validatedExporters
+	templateData["UsageLogsExporterNames"] = exporterNames
+	templateData["UsageLogsCredentialSecret"] = usageLogs.CredentialSecret
+
+	// Sorted so the rendered processor is byte-stable across reconciles; an
+	// unordered map would churn the collector on every pass.
+	attributeNames := make([]string, 0, len(usageLogs.Attributes))
+	for name := range usageLogs.Attributes {
+		attributeNames = append(attributeNames, name)
+	}
+	sort.Strings(attributeNames)
+	templateData["UsageLogsAttributes"] = usageLogs.Attributes
+	templateData["UsageLogsAttributeNames"] = attributeNames
 
 	return nil
 }
@@ -730,6 +823,11 @@ func getStringValueOrDefault(value, defaultValue string) string {
 }
 
 // --- Exporter validation ---
+
+// errUsageLogsExporterInvalid marks a template-data failure that came from the
+// usage-log exporter allowlist, so the reconciler can point the usage-log condition at
+// it instead of reporting only a generic configuration error for the whole service.
+var errUsageLogsExporterInvalid = errors.New("invalid usage logs exporter configuration")
 
 func validateExporters(exporters map[string]runtime.RawExtension) (map[string]string, error) {
 	validatedExporters := make(map[string]string)
