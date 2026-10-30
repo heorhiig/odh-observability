@@ -52,6 +52,10 @@ make deploy NAMESPACE=opendatahub IMG=quay.io/opendatahub/odh-observability:odh-
 make undeploy
 ```
 
+## Compatibility matrix
+
+Known-good and known-bad COO / Tempo / related dependency versions for RHOAI releases are documented in [docs/compatibility-matrix.md](docs/compatibility-matrix.md) (machine-readable: [docs/compatibility-matrix.yaml](docs/compatibility-matrix.yaml)). The automated golden-pair gate is `make e2e-test-coo-compatibility` — see [tests/e2e/README.md](tests/e2e/README.md).
+
 ## Custom Resource
 
 Create a `Monitoring` CR to configure the observability stack:

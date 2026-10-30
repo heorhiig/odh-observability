@@ -21,15 +21,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 )
 
 func TestMethodGateHandler(t *testing.T) {
 	// Upstream records whether it was ever reached, so we can assert that rejected
-	// methods never make it past the gate.
-	var upstreamHits int
+	// methods never make it past the gate. atomic: httptest serves on another
+	// goroutine than the assertions below.
+	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upstreamHits++
+		upstreamHits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("upstream"))
 	}))
@@ -59,7 +61,7 @@ func TestMethodGateHandler(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.method, func(t *testing.T) {
-			upstreamHits = 0
+			upstreamHits.Store(0)
 
 			req, err := http.NewRequestWithContext(context.Background(), tc.method, gate.URL+"/api/v1/query?namespace=allowed", nil)
 			if err != nil {
@@ -74,7 +76,7 @@ func TestMethodGateHandler(t *testing.T) {
 			if resp.StatusCode != tc.wantStatus {
 				t.Errorf("%s: got status %d, want %d", tc.method, resp.StatusCode, tc.wantStatus)
 			}
-			forwarded := upstreamHits > 0
+			forwarded := upstreamHits.Load() > 0
 			if forwarded != tc.wantForwarded {
 				t.Errorf("%s: forwarded to upstream = %t, want %t", tc.method, forwarded, tc.wantForwarded)
 			}

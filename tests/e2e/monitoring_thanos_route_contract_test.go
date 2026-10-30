@@ -196,6 +196,31 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	}
 	assertThanosRouteNamespaceSeries(t, "crafted selector", crafted.Labels, tc.MonitoringNamespace)
 
+	// POST cases are stopped by the method gate before prom-label-proxy, so they
+	// no longer exercise the GET single-value / --regex-match guard. Two
+	// namespace query values must not leak series from the second namespace:
+	// with --regex-match, prom-label-proxy rejects multiple values with 400.
+	const secondNamespace = "kube-system"
+	dualNamespace, err := probeThanosRouteWithNamespaces(
+		rootCAs,
+		routeHost,
+		authorizedToken,
+		[]string{tc.MonitoringNamespace, secondNamespace},
+		thanosRouteProbeQuery,
+	)
+	if err != nil {
+		t.Fatalf("dual-namespace GET probe failed: %v", err)
+	}
+	logThanosRouteEvidence(t, "authorized-dual-namespace-get", dualNamespace)
+	for _, labels := range dualNamespace.Labels {
+		if labels["namespace"] == secondNamespace {
+			t.Fatalf("GET with two namespace query values must not return series from %q", secondNamespace)
+		}
+	}
+	if dualNamespace.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("GET with two namespace query values must be rejected with 400 by the single-value/--regex-match guard, got http_status=%d", dualNamespace.HTTPStatus)
+	}
+
 	// The Thanos proxy fronts prom-label-proxy with the read-only method gate, so
 	// every POST is rejected with 403 before prom-label-proxy can ParseForm and
 	// merge a body "namespace" into the enforced label matcher. metricsRole grants
@@ -211,7 +236,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		routeHost,
 		authorizedToken,
 		tc.MonitoringNamespace,
-		"kube-system",
+		secondNamespace,
 		thanosRouteProbeQuery,
 	)
 	if err != nil {
@@ -461,13 +486,19 @@ func probeThanosRoute(t *testing.T, rootCAs *x509.CertPool, routeHost, token, na
 }
 
 func probeThanosRouteWithError(rootCAs *x509.CertPool, routeHost, token, namespace, promQL string) (thanosRouteProbe, error) {
+	return probeThanosRouteWithNamespaces(rootCAs, routeHost, token, []string{namespace}, promQL)
+}
+
+func probeThanosRouteWithNamespaces(rootCAs *x509.CertPool, routeHost, token string, namespaces []string, promQL string) (thanosRouteProbe, error) {
 	endpoint := url.URL{
 		Scheme: "https",
 		Host:   routeHost,
 		Path:   "/api/v1/query",
 	}
 	query := endpoint.Query()
-	query.Set("namespace", namespace)
+	for _, namespace := range namespaces {
+		query.Add("namespace", namespace)
+	}
 	query.Set("query", promQL)
 	endpoint.RawQuery = query.Encode()
 
