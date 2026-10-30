@@ -1632,6 +1632,24 @@ func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext, platf
 	}
 }
 
+func requireUsageLogsMonitoringReady(t *testing.T, tc *TestContext) {
+	t.Helper()
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(gomega.And(
+			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
+			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
+			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
+		)),
+		WithEventuallyTimeout(10*time.Minute),
+		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
+	)
+}
+
 func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
@@ -1724,10 +1742,12 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		applyMonitoringManifest(t, tc, dir)
 	}
 
+	// This scenario configures usageLogs storage, so it is the usage logs
+	// LokiStack that must come up; the log forwarding one is never requested.
 	waitFor(
-		"LokiStack "+LokiStackName+" should be Ready",
+		"LokiStack "+UsageLogsLokiStackName+" should be Ready",
 		gvk.LokiStack,
-		types.NamespacedName{Name: LokiStackName, Namespace: inferenceMonitoringNamespace()},
+		types.NamespacedName{Name: UsageLogsLokiStackName, Namespace: inferenceMonitoringNamespace()},
 		"Ready",
 		20*time.Minute,
 	)
@@ -1744,25 +1764,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// write the Monitoring spec yourself, but this test does not: the spec propagates
 	// DSCI -> opendatahub-operator -> Monitoring. The guard above only proves the stanza
 	// survived the DSCI CRD, so confirm the ask landed here before trusting Degraded.
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
-		WithCondition(gomega.And(
-			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
-			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
-			// Every action function runs before AggregateReady in the same pass, so
-			// ProvisioningSucceeded=True means the feature conditions Degraded reads are from
-			// this reconcile. The early-return paths skip the aggregation and leave them stale.
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
-			// Implied by the above, but asserted directly because it is the artifact the envoy
-			// filter consumes. An absent field compares as null, so default it first.
-			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
-		)),
-		WithEventuallyTimeout(10*time.Minute),
-		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
-	)
+	requireUsageLogsMonitoringReady(t, tc)
 	waitFor(
 		"DSC default-dsc should be Ready",
 		schema.GroupVersionKind{

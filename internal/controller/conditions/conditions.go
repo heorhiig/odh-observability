@@ -26,6 +26,14 @@ import (
 
 // Monitoring-specific condition type constants.
 const (
+	// ConditionCOOVersionCompatible reports whether the installed COO version is
+	// within the version line validated for the current RHOAI release.
+	ConditionCOOVersionCompatible = "COOVersionCompatible"
+
+	// COOSupportedVersionLine is the Cluster Observability Operator minor line
+	// validated by the RHOAI 3.6 compatibility release gate.
+	COOSupportedVersionLine = "v1.5"
+
 	// ConditionMonitoringDependenciesReady indicates whether all external
 	// operators required by the configured monitoring features are installed.
 	ConditionMonitoringDependenciesReady = "MonitoringDependenciesReady"
@@ -73,7 +81,12 @@ const (
 	// ConditionUsageLogsCollectorAvailable indicates the usage logs OpenTelemetry collector is deployed.
 	ConditionUsageLogsCollectorAvailable = "UsageLogsCollectorAvailable"
 
-	// ConditionLokiStackAvailable indicates the LokiStack CR is deployed.
+	// ConditionUsageLogsLokiStackAvailable indicates the usage logs LokiStack CR is deployed.
+	ConditionUsageLogsLokiStackAvailable = "UsageLogsLokiStackAvailable"
+
+	// ConditionLokiStackAvailable indicates the log forwarding LokiStack CR is
+	// deployed. It is separate from ConditionUsageLogsLokiStackAvailable: the
+	// two stacks are independent CRs with independent storage.
 	ConditionLokiStackAvailable = "LokiStackAvailable"
 
 	// ConditionClusterLogForwarderAvailable indicates the ClusterLogForwarder CR is deployed.
@@ -124,6 +137,7 @@ var featureConditionTypes = map[string]bool{
 	ConditionNodeMetricsEndpointAvailable:        true,
 	ConditionWebhookAvailable:                    true,
 	ConditionUsageLogsCollectorAvailable:         true,
+	ConditionUsageLogsLokiStackAvailable:         true,
 	ConditionLokiStackAvailable:                  true,
 	ConditionClusterLogForwarderAvailable:        true,
 	ConditionKorrel8rAvailable:                   true,
@@ -179,6 +193,18 @@ func (cm *ConditionsManager) MarkFalse(condType, reason, message string) {
 	})
 }
 
+// MarkWarning sets a non-blocking condition to False with informational severity.
+func (cm *ConditionsManager) MarkWarning(condType, reason, message string) {
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
+		Type:               condType,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		Severity:           platformcommon.ConditionSeverityInfo,
+		ObservedGeneration: cm.generation,
+	})
+}
+
 // MarkNotConfigured sets a condition to False with ConditionSeverityInfo,
 // indicating the feature is intentionally not configured by the user.
 // Info-severity conditions are excluded from Degraded aggregation.
@@ -193,12 +219,18 @@ func (cm *ConditionsManager) MarkNotConfigured(condType, reason, message string)
 	})
 }
 
-// MarkUnknown sets a condition to Unknown.
-func (cm *ConditionsManager) MarkUnknown(condType string) {
+// MarkUnknown sets a condition to Unknown with the given reason and message.
+//
+// Unknown means the state could not be observed, which is not the same as
+// observing that it is bad: AggregateReady reports Unknown features as
+// Ready=Unknown rather than Degraded, and callers that act on a feature's
+// condition should hold their last known good value rather than tear down.
+func (cm *ConditionsManager) MarkUnknown(condType, reason, message string) {
 	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
 		Type:               condType,
 		Status:             metav1.ConditionUnknown,
-		Reason:             "Progressing",
+		Reason:             reason,
+		Message:            message,
 		ObservedGeneration: cm.generation,
 	})
 }
@@ -251,7 +283,7 @@ func (cm *ConditionsManager) AggregateReady() {
 		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "FeatureUnavailable", "A configured monitoring feature is unavailable")
 		cm.MarkTrue(string(platformcommon.ConditionTypeDegraded))
 	case anyUnknown:
-		cm.MarkUnknown(string(platformcommon.ConditionTypeReady))
+		cm.MarkUnknown(string(platformcommon.ConditionTypeReady), "Progressing", "")
 		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
 	default:
 		cm.MarkTrue(string(platformcommon.ConditionTypeReady))

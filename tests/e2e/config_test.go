@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 )
 
 // API mode constants for test configuration.
@@ -259,17 +261,17 @@ func rejectSymlinkInPath(path string) error {
 	}
 }
 
-// releaseGateContract is the only place to edit when the compatibility release gate targets a new RHOAI/COO line.
-// There are no CLI flags or env overrides. Update this block, adjust release-gate unit tests if prefixes change,
-// sync PersesImage with internal/controller/templatedata.go getPersesImage() when that default moves, and run
-// TestCOOVersionCompatibility on a clean cluster before merge.
+// releaseGateContract holds the RHOAI CSV and Perses image values for the compatibility release gate.
+// Its COO version line is shared with the runtime compatibility condition in internal/controller/conditions.
+// Keep PersesImage aligned with internal/controller/templatedata.go getPersesImage() and run
+// TestCOOVersionCompatibility on a clean cluster when updating this release gate.
 var releaseGateContract = struct {
 	RHOAICSVPrefix string
 	COOCSVPrefix   string
 	PersesImage    string
 }{
 	RHOAICSVPrefix: "rhods-operator.3.6",
-	COOCSVPrefix:   "cluster-observability-operator.v1.5",
+	COOCSVPrefix:   "cluster-observability-operator." + conditions.COOSupportedVersionLine,
 	PersesImage:    "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:a811b9345d884ba1c575584bec9be1d2a237902164a99887458a82d07e7c2376",
 }
 

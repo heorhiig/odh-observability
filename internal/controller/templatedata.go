@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
@@ -59,6 +60,8 @@ const (
 
 	defaultStorageSize = "5Gi"
 	defaultRetention   = "90d"
+
+	defaultLokiStorageClassName = "gp3-csi"
 
 	defaultTracesSampleRatio = "0.1"
 	defaultTracesBackend     = "pv"
@@ -197,40 +200,10 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		}
 	}
 
-	// LokiStack configuration
-	lokiStackName := lokiStackResourceName
-	templateData["LokiStackName"] = lokiStackName
-	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
-	// application tenant is the pinned tenant for inference logs.
-	templateData["LokiTenant"] = "application"
 	templateData["ThanosQuerierEndpoint"] = fmt.Sprintf("http://thanos-querier-data-science-thanos-querier.%s.svc.cluster.local:10902", monitoringNamespace)
-	templateData["LokiQueryEndpoint"] = fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, monitoringNamespace)
-	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
-	var lokiStorage *v1alpha1.LokiStorageConfig
-	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
-		lokiStorage = logs.Storage
-	} else if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		lokiStorage = usageLogs.Storage
-	}
 
-	if lokiStorage != nil {
-		templateData["LokiStorageCredentialMode"] = lokiStorage.CredentialMode
-		templateData["LokiStorageSecretName"] = lokiStorage.SecretName
-		templateData["LokiStorageType"] = lokiStorage.Type
-
-		storageClassName := lokiStorage.StorageClassName
-		if storageClassName == "" {
-			storageClassName = "gp3-csi"
-		}
-		templateData["LokiStorageClassName"] = storageClassName
-	} else {
-		templateData["LokiStorageCredentialMode"] = ""
-		templateData["LokiStorageSecretName"] = ""
-		templateData["LokiStorageType"] = ""
-		templateData["LokiStorageClassName"] = ""
-	}
-
-	if err := addUsageLogsData(monitoring, lokiStackName, monitoringNamespace, templateData); err != nil {
+	addLokiTemplateData(monitoring, monitoringNamespace, templateData)
+	if err := addUsageLogsData(monitoring, usageLogsLokiStackResourceName, monitoringNamespace, templateData); err != nil {
 		return nil, err
 	}
 
@@ -280,6 +253,56 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	return templateData, nil
+}
+
+// addLokiTemplateData fills in the names, query endpoints, and storage settings
+// for both LokiStacks: the usage logs stack backed by usageLogs.Storage and the
+// log forwarding stack backed by logs.Storage. They are separate CRs, so
+// neither feature's storage configuration leaks into the other's stack.
+func addLokiTemplateData(monitoring *v1alpha1.Monitoring, monitoringNamespace string, templateData map[string]any) {
+	templateData["UsageLogsLokiStackName"] = usageLogsLokiStackResourceName
+	templateData["LokiStackName"] = lokiStackResourceName
+	// Both LokiStacks are configured in OpenShift logging mode. Their
+	// application tenant is the pinned tenant for inference logs.
+	templateData["LokiTenant"] = "application"
+	templateData["LokiQueryEndpoint"] = lokiGatewayURL(lokiStackResourceName, monitoringNamespace)
+
+	var usageLogsLokiStorage, lokiStorage *v1alpha1.LokiStorageConfig
+	logsLokiStackSize := defaultLokiStackSize
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil {
+		usageLogsLokiStorage = usageLogs.Storage
+	}
+	if logs := monitoring.Spec.Logs; logs != nil {
+		lokiStorage = logs.Storage
+		logsLokiStackSize = getStringValueOrDefault(logs.Size, defaultLokiStackSize)
+	}
+	templateData["LogsLokiStackSize"] = logsLokiStackSize
+	addLokiStorageData("UsageLogsLoki", usageLogsLokiStorage, templateData)
+	addLokiStorageData("Loki", lokiStorage, templateData)
+}
+
+// lokiGatewayURL returns the in-cluster gateway URL for the application tenant
+// of the named LokiStack.
+func lokiGatewayURL(lokiStackName, namespace string) string {
+	return fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, namespace)
+}
+
+// addLokiStorageData writes the <prefix>Storage* keys for one LokiStack.
+// Templates render with missingkey=error, so the keys are always set, blank
+// when that stack has no storage configured.
+func addLokiStorageData(prefix string, storage *v1alpha1.LokiStorageConfig, templateData map[string]any) {
+	if storage == nil {
+		templateData[prefix+"StorageCredentialMode"] = ""
+		templateData[prefix+"StorageSecretName"] = ""
+		templateData[prefix+"StorageType"] = ""
+		templateData[prefix+"StorageClassName"] = ""
+		return
+	}
+
+	templateData[prefix+"StorageCredentialMode"] = storage.CredentialMode
+	templateData[prefix+"StorageSecretName"] = storage.SecretName
+	templateData[prefix+"StorageType"] = storage.Type
+	templateData[prefix+"StorageClassName"] = getStringValueOrDefault(storage.StorageClassName, defaultLokiStorageClassName)
 }
 
 // addKorrel8rConfigChecksum derives the Pod-template value that restarts
@@ -373,7 +396,19 @@ func kubernetesAPIServerCIDRs(endpointSlices []discoveryv1.EndpointSlice) ([]str
 // Returns a missingOperatorsError listing all confirmed missing operators, or
 // the operational error encountered while checking for them.
 func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+	_, err := checkMonitoringPreconditionsWithCOOVersion(ctx, c, monitoring)
+	return err
+}
+
+// checkMonitoringPreconditionsWithCOOVersion returns the installed COO version
+// when built-in metrics storage requires COO, along with any precondition error.
+func checkMonitoringPreconditionsWithCOOVersion(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+) (*cluster.OperatorInfo, error) {
 	var allErrors *multierror.Error
+	var cooInfo *cluster.OperatorInfo
 
 	// Two different questions. Loki is needed only for a cluster-local store, so a
 	// cluster that just forwards needs no Loki operator at all. The collector is needed
@@ -385,9 +420,15 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 
 	checkOperatorNames := func(names []string, missingMessage string) error {
 		for _, name := range names {
-			_, err := olm.OperatorExists(ctx, c, name)
+			info, err := olm.OperatorExists(ctx, c, name)
 			switch {
 			case err == nil:
+				if name == clusterObservabilityOperator {
+					cooInfo, err = cooInstalledCSVVersion(ctx, c, info)
+					if err != nil {
+						return fmt.Errorf("checking installed Cluster Observability Operator CSV: %w", err)
+					}
+				}
 				return nil
 			case errors.Is(err, olm.ErrOperatorNotInstalled):
 				continue
@@ -404,7 +445,7 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 
 	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsCollector {
 		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
@@ -416,40 +457,138 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 			[]string{certManagerOperator, "openshift-cert-manager-operator"},
 			conditions.CertManagerOperatorMissingMessage,
 		); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	// COO owns MonitoringStack/Thanos/Perses; only required for built-in metrics storage.
 	if monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil {
 		if err := checkOperator(clusterObservabilityOperator, conditions.COOMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	// Tempo is only required for built-in storage; exporters-only traces use the collector.
 	if monitoring.Spec.Traces != nil && monitoring.Spec.Traces.Storage != nil {
 		if err := checkOperator(tempoOperator, conditions.TempoOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if needsLoki {
 		if err := checkOperator(lokiOperator, conditions.LokiOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if monitoring.Spec.Logs != nil {
 		if err := checkOperator(clusterLoggingOperator, conditions.ClusterLoggingOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if err := allErrors.ErrorOrNil(); err != nil {
-		return &missingOperatorsError{err: err}
+		return cooInfo, &missingOperatorsError{err: err}
 	}
-	return nil
+	return cooInfo, nil
+}
+
+// cooInstalledCSVVersion uses the current successful OLMv0 CSV as the
+// authoritative COO version. OperatorCondition names can include an old
+// version while an upgrade is in progress. If the CSV API is unavailable,
+// retain the version supplied by OperatorExists for OLMv1 installations.
+func cooInstalledCSVVersion(
+	ctx context.Context,
+	c client.Reader,
+	fallback *cluster.OperatorInfo,
+) (*cluster.OperatorInfo, error) {
+	csvList := &unstructured.UnstructuredList{}
+	csvList.SetGroupVersionKind(gvk.ClusterServiceVersion.GroupVersion().WithKind("ClusterServiceVersionList"))
+	if err := c.List(ctx, csvList); err != nil {
+		if meta.IsNoMatchError(err) {
+			return fallback, nil
+		}
+		return nil, err
+	}
+
+	type installedCSV struct {
+		name      string
+		namespace string
+		version   string
+	}
+
+	const namePrefix = clusterObservabilityOperator + "."
+	var installed []installedCSV
+	replaced := make(map[string]struct{})
+	for i := range csvList.Items {
+		csv := &csvList.Items[i]
+		name := csv.GetName()
+		if !strings.HasPrefix(name, namePrefix) {
+			continue
+		}
+
+		phase, found, err := unstructured.NestedString(csv.Object, "status", "phase")
+		if err != nil {
+			return nil, fmt.Errorf("reading CSV %q status.phase: %w", name, err)
+		}
+		if !found || phase != "Succeeded" {
+			continue
+		}
+
+		installed = append(installed, installedCSV{
+			name:      name,
+			namespace: csv.GetNamespace(),
+			version:   strings.TrimPrefix(name, namePrefix),
+		})
+		replaces, hasReplaces, err := unstructured.NestedString(csv.Object, "spec", "replaces")
+		if err != nil {
+			return nil, fmt.Errorf("reading CSV %q spec.replaces: %w", name, err)
+		}
+		if hasReplaces {
+			replaced[csv.GetNamespace()+"/"+replaces] = struct{}{}
+		}
+	}
+
+	// During an upgrade, the new succeeded CSV replaces the previous one. If
+	// multiple versions are still succeeded, select the terminal CSV in that
+	// replacement chain rather than relying on API list order.
+	var current []installedCSV
+	for _, csv := range installed {
+		if _, wasReplaced := replaced[csv.namespace+"/"+csv.name]; !wasReplaced {
+			current = append(current, csv)
+		}
+	}
+	if len(current) != 1 {
+		extensionInfo, err := cluster.OperatorInstalledViaClusterExtension(ctx, c, clusterObservabilityOperator)
+		if err != nil && !meta.IsNoMatchError(err) {
+			return nil, fmt.Errorf("checking installed Cluster Observability Operator ClusterExtension: %w", err)
+		}
+		if extensionInfo != nil {
+			return extensionInfo, nil
+		}
+		return cluster.NewOperatorInfo(""), nil
+	}
+	return cluster.NewOperatorInfo(current[0].version), nil
+}
+
+func markCOOVersionCompatibility(cm *conditions.ConditionsManager, info *cluster.OperatorInfo) {
+	supportedPrefix := conditions.COOSupportedVersionLine + "."
+	if info == nil || info.Version == "" {
+		cm.MarkWarning(conditions.ConditionCOOVersionCompatible, "VersionUnavailable",
+			fmt.Sprintf("Unable to determine the installed Cluster Observability Operator version; the supported version line is %s.x", conditions.COOSupportedVersionLine))
+		return
+	}
+	if strings.HasPrefix(info.Version, supportedPrefix) {
+		cm.MarkTrue(conditions.ConditionCOOVersionCompatible)
+		return
+	}
+
+	message := fmt.Sprintf(
+		"Detected Cluster Observability Operator version %s outside the supported version line %s.x; this combination is untested",
+		info.Version,
+		conditions.COOSupportedVersionLine,
+	)
+	cm.MarkWarning(conditions.ConditionCOOVersionCompatible, "UnsupportedVersion", message)
 }
 
 func builtinDCGMScrapeEnabled(metrics *v1alpha1.Metrics) bool {
@@ -542,15 +681,13 @@ func addExportersData(metrics *v1alpha1.Metrics, templateData map[string]any) er
 }
 
 // addUsageLogsData resolves everything the usage-log collector renders from: the LokiStack
-// size that governs the shared stack, whether the cluster-local write is configured and the
+// size of the usage stack, whether the cluster-local write is configured and the
 // endpoint it uses, and the remote exporters alongside it. Kept out of buildTemplateData so
 // that function stays under the cyclomatic complexity limit.
 func addUsageLogsData(monitoring *v1alpha1.Monitoring, lokiStackName, monitoringNamespace string, templateData map[string]any) error {
 	usageLogs := monitoring.Spec.UsageLogs
 
-	// LokiStack size. One stack currently serves both cluster log forwarding and usage
-	// logs, so the usage-log size governs it; when the two stacks split this follows
-	// the usage stack. Unset means the shipped default.
+	// The usage-log size applies only to the usage stack.
 	lokiStackSize := defaultLokiStackSize
 	if usageLogs != nil && usageLogs.Size != "" {
 		lokiStackSize = usageLogs.Size
